@@ -1,0 +1,706 @@
+openapi: 3.1.0
+
+info:
+  title: TV Poll Voting API
+  version: 0.1.0-draft
+  description: >
+    Публичный и админский контракт сервиса опросов, привязанных к минутному
+    ТВ-ролику (см. docs/ai/00-task-original.md). Обоснование решений,
+    зафиксированных в этой спеке, — в docs/ai/05-api-contract.md.
+
+
+    Разделение на два роутера соответствует docs/ai/01-stack.md: у публичных
+    эндпоинтов (`public`) нет авторизации, но есть rate limit; у админских
+    (`admin`) — наоборот. `internal`-эндпоинты предназначены для
+    оркестратора/CI, не для браузера.
+
+servers:
+  - url: http://localhost:8080
+    description: Локальный запуск (docker-compose)
+
+tags:
+  - name: public
+    description: Без авторизации. Ограничены rate limit'ом.
+  - name: admin
+    description: Bearer-токен из ADMIN_TOKEN. Без rate limit.
+  - name: internal
+    description: Для оркестратора прескейлинга и инфраструктуры, не для браузера.
+
+security: []
+
+paths:
+  /v1/polls/{pollId}:
+    get:
+      tags: [public]
+      operationId: getPoll
+      summary: Получить определение опроса
+      description: >
+        Иммутабельно с момента публикации (state != draft), поэтому отдаётся
+        с агрессивным Cache-Control — предполагается, что в проде этот ответ
+        обслуживает CDN, а не бэкенд напрямую (docs/ai/02-load-model.md §6.1).
+        Опрос в состоянии draft не существует для внешнего мира — 404,
+        чтобы не спойлерить вопрос до публикации.
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      responses:
+        '200':
+          description: Опрос найден и опубликован (scheduled/open/closed).
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=604800, immutable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollPublic'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/polls/{pollId}/token:
+    post:
+      tags: [public]
+      operationId: issueVoteToken
+      summary: Выдать анонимный токен голосования
+      description: >
+        Первый шаг двухшагового флоу голосования (docs/ai/01-stack.md, раздел
+        про k6): токен нужно получить один раз при открытии страницы, до
+        отправки голоса. Токен — самоподписанный (HMAC-SHA256 над
+        poll_id+issued_at+nonce), выдача не требует обращения к Redis —
+        обращение к Redis происходит только при самом голосовании (проверка
+        dedup-ключа), см. docs/ai/05-api-contract.md.
+
+        Сервер одновременно ставит cookie `vote_token` (не HttpOnly — чтобы
+        фронтенд мог продублировать значение в localStorage) и возвращает тот
+        же токен в теле ответа, согласно схеме из docs/ai/01-stack.md
+        («Граница с фронтендом», пункт 2).
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      responses:
+        '201':
+          description: Токен выдан.
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+                example: vote_token=<opaque>; SameSite=None; Secure; Max-Age=<seconds_until_poll_closes>
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoteToken'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /v1/polls/{pollId}/votes:
+    post:
+      tags: [public]
+      operationId: castVote
+      summary: Проголосовать
+      description: >
+        Единственный эндпоинт, который реально обслуживает бэкенд под пиковой
+        нагрузкой (docs/ai/02-load-model.md §6.1). Токен принимается из cookie
+        `vote_token` ИЛИ заголовка `X-Vote-Token` — сервер принимает любой из
+        двух источников (docs/ai/01-stack.md). Ровно один голос на валидный
+        токен: гонки разрешаются атомарным Lua-скриптом в Redis
+        (docs/ai/01-stack.md, «Redis как горячий путь»).
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      security:
+        - voteCookie: []
+        - voteHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoteRequest'
+      responses:
+        '201':
+          description: Голос принят и учтён в счётчике.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoteAccepted'
+        '400':
+          description: Некорректный option_id (не существует в опросе).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Токен голосования отсутствует, просрочен или не проходит проверку подписи.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: >
+            Голос отклонён: либо повторное голосование этим токеном
+            (`reason=duplicate`), либо опрос сейчас не принимает голоса —
+            draft/scheduled/closed (`reason=closed`). Соответствует меткам
+            `votes_rejected_total{reason}` из docs/ai/01-stack.md.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoteRejected'
+        '429':
+          description: >
+            Уровень 1 деградации (docs/ai/02-load-model.md §6.7): превышен
+            лимит запросов. `Retry-After` намеренно содержит случайный
+            разброс, чтобы клиенты не ретраили синхронно.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                description: Секунды, с джиттером.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoteRejected'
+        '503':
+          description: >
+            Уровень 3 деградации: Redis недоступен, приём голосов остановлен.
+            Результаты по уже принятым голосам продолжают отдаваться через
+            /results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/admin/polls:
+    post:
+      tags: [admin]
+      operationId: createPoll
+      summary: Создать опрос
+      security:
+        - adminBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PollCreateRequest'
+      responses:
+        '201':
+          description: Опрос создан в состоянии draft.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollAdmin'
+        '400':
+          description: Невалидный опрос (меньше 2 вариантов и т.п.).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    get:
+      tags: [admin]
+      operationId: listPolls
+      summary: Список опросов
+      security:
+        - adminBearer: []
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/PollState'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Список опросов.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PollAdmin'
+                  total:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/admin/polls/{pollId}:
+    get:
+      tags: [admin]
+      operationId: getPollAdmin
+      summary: Получить опрос (админский вид, включая внутренние поля)
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      responses:
+        '200':
+          description: Опрос найден.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollAdmin'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/polls/{pollId}/transitions:
+    post:
+      tags: [admin]
+      operationId: transitionPoll
+      summary: Перевести опрос в следующее состояние FSM
+      description: >
+        Единый эндпоинт для переходов draft → scheduled → open → closed
+        (docs/ai/01-stack.md). Переход, не разрешённый текущим состоянием
+        (например open → draft), — 409. `scheduled_at` обязателен только
+        при переходе в scheduled.
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PollTransitionRequest'
+      responses:
+        '200':
+          description: Переход выполнен.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollAdmin'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Переход недопустим из текущего состояния.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/admin/polls/{pollId}/results:
+    get:
+      tags: [admin]
+      operationId: getPollResults
+      summary: Обезличенные результаты опроса
+      description: >
+        Данные eventually consistent (docs/ai/02-load-model.md §6.6):
+        значение — это снапшот, снятый воркером не более секунды назад, а не
+        чтение "вживую" из Redis.
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      responses:
+        '200':
+          description: Результаты.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollResults'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/admin/polls/{pollId}/results/timeseries:
+    get:
+      tags: [admin]
+      operationId: getPollResultsTimeseries
+      summary: Динамика голосования по времени
+      description: >
+        Строится из истории снапшотов в Postgres — побочный продукт схемы
+        снапшотирования (docs/ai/01-stack.md, раздел про PostgreSQL).
+      security:
+        - adminBearer: []
+      parameters:
+        - $ref: '#/components/parameters/PollId'
+      responses:
+        '200':
+          description: Точки снапшотов, по возрастанию времени.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [points]
+                properties:
+                  points:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ResultsSnapshotPoint'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /internal/warmup:
+    post:
+      tags: [internal]
+      operationId: warmup
+      summary: Прогреть пулы соединений и загрузить Lua-скрипт перед эфиром
+      description: >
+        Вызывается оркестратором по расписанию эфира, не человеком
+        (docs/ai/02-load-model.md §6.5): прескейлинг детерминирован сеткой
+        вещания, а не реактивным автоскейлингом. Без тела — прогревает пулы
+        в целом; с `poll_id` — дополнительно проверяет, что опрос существует
+        и его данные закешированы в памяти инстанса.
+      security:
+        - adminBearer: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                poll_id:
+                  type: string
+                  format: uuid
+      responses:
+        '202':
+          description: Прогрев запущен (асинхронно).
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /healthz:
+    get:
+      tags: [internal]
+      operationId: healthz
+      summary: Liveness-проверка для docker-compose / оркестратора
+      security: []
+      responses:
+        '200':
+          description: Сервис жив.
+
+  /metrics:
+    get:
+      tags: [internal]
+      operationId: metrics
+      summary: Prometheus-метрики
+      description: >
+        Формат exposition Prometheus. Минимальный набор метрик перечислен в
+        docs/ai/01-stack.md (votes_accepted_total, votes_rejected_total{reason},
+        гистограмма латентности, redis_command_duration_seconds, inflight_requests).
+      security: []
+      responses:
+        '200':
+          description: Метрики в текстовом формате Prometheus.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  parameters:
+    PollId:
+      name: pollId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  securitySchemes:
+    adminBearer:
+      type: http
+      scheme: bearer
+      description: >
+        Статический токен из ADMIN_TOKEN, сравнение через
+        subtle.ConstantTimeCompare (docs/ai/01-stack.md). Используется и для
+        /internal/warmup — отдельный секрет для этого ради простоты не заводится.
+    voteCookie:
+      type: apiKey
+      in: cookie
+      name: vote_token
+    voteHeader:
+      type: apiKey
+      in: header
+      name: X-Vote-Token
+
+  responses:
+    NotFound:
+      description: Опрос не найден.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Отсутствует или неверен Bearer-токен администратора.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: Rate limit превышен.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: invalid_option
+            message:
+              type: string
+
+    PollState:
+      type: string
+      enum: [draft, scheduled, open, closed]
+      description: FSM опроса, docs/ai/01-stack.md.
+
+    PollOption:
+      type: object
+      required: [id, label]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+
+    PollOptionInput:
+      type: object
+      required: [label]
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 200
+
+    PollPublic:
+      type: object
+      required: [id, question, options, state]
+      properties:
+        id:
+          type: string
+          format: uuid
+        question:
+          type: string
+        options:
+          type: array
+          items:
+            $ref: '#/components/schemas/PollOption'
+        state:
+          $ref: '#/components/schemas/PollState'
+        opens_at:
+          type: [string, "null"]
+          format: date-time
+        closes_at:
+          type: [string, "null"]
+          format: date-time
+          description: >
+            Известно только пока state=open (окно приёма определено).
+            Дефолт длины окна — 5 минут (docs/ai/02-load-model.md §6.4),
+            это НЕ длительность ролика.
+
+    PollAdmin:
+      allOf:
+        - $ref: '#/components/schemas/PollPublic'
+        - type: object
+          required: [scheduled_at, voting_window_seconds, created_at, updated_at]
+          properties:
+            scheduled_at:
+              type: [string, "null"]
+              format: date-time
+              description: Плановое время эфира — вход для /internal/warmup.
+            voting_window_seconds:
+              type: integer
+              description: Длина окна приёма голосов от момента open. По умолчанию 300с.
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+
+    PollCreateRequest:
+      type: object
+      required: [question, options]
+      properties:
+        question:
+          type: string
+          minLength: 1
+          maxLength: 500
+        options:
+          type: array
+          minItems: 2
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/PollOptionInput'
+        scheduled_at:
+          type: [string, "null"]
+          format: date-time
+          description: Если задано — опрос сразу создаётся в scheduled, а не draft.
+        voting_window_seconds:
+          type: integer
+          default: 300
+          minimum: 30
+
+    PollTransitionRequest:
+      type: object
+      required: [to]
+      properties:
+        to:
+          type: string
+          enum: [scheduled, open, closed]
+          description: Целевое состояние. draft недостижим как цель перехода — это только начальное состояние.
+        scheduled_at:
+          type: string
+          format: date-time
+          description: Обязательно при to=scheduled, игнорируется иначе.
+
+    VoteToken:
+      type: object
+      required: [token, expires_at]
+      properties:
+        token:
+          type: string
+          description: Самоподписанный opaque-токен, см. docs/ai/05-api-contract.md.
+        expires_at:
+          type: string
+          format: date-time
+          description: >
+            Равен closes_at опроса на момент выдачи (не фиксированный сдвиг
+            от issued_at) — иначе токен, выданный ближе к концу окна, либо
+            переживает закрытие, либо протухает раньше времени. См.
+            docs/ai/03-deduplication.md §2.3.
+
+    VoteRequest:
+      type: object
+      required: [option_id]
+      properties:
+        option_id:
+          type: string
+
+    VoteAccepted:
+      type: object
+      required: [status, option_id]
+      properties:
+        status:
+          type: string
+          enum: [accepted]
+        option_id:
+          type: string
+
+    VoteRejected:
+      type: object
+      required: [status, reason]
+      properties:
+        status:
+          type: string
+          enum: [rejected]
+        reason:
+          type: string
+          enum: [duplicate, closed, rate_limited]
+          description: Совпадает со значениями метки reason у votes_rejected_total (docs/ai/01-stack.md).
+
+    PollResults:
+      type: object
+      required: [poll_id, state, total_accepted, options, snapshot_at, sampling]
+      properties:
+        poll_id:
+          type: string
+          format: uuid
+        state:
+          $ref: '#/components/schemas/PollState'
+        total_accepted:
+          type: integer
+        rejected:
+          type: object
+          description: >
+            Продуктовый сигнал накрутки: резкий рост доли duplicate во время
+            эфира (docs/ai/01-stack.md, раздел про Prometheus-метрики).
+          properties:
+            duplicate:
+              type: integer
+            rate_limited:
+              type: integer
+        options:
+          type: array
+          items:
+            type: object
+            required: [option_id, label, count]
+            properties:
+              option_id:
+                type: string
+              label:
+                type: string
+              count:
+                type: integer
+              share:
+                type: number
+                description: count / total_accepted, для удобства фронтенда админки.
+        snapshot_at:
+          type: string
+          format: date-time
+          description: Время снятия снапшота воркером, не "прямо сейчас" (eventually consistent).
+        sampling:
+          type: object
+          required: [enabled]
+          description: >
+            Прозрачность деградации уровня 2 (docs/ai/02-load-model.md §6.7):
+            если сэмплирование когда-либо включалось для этого опроса, это
+            обязано быть видно в результатах, а не только в логах.
+          properties:
+            enabled:
+              type: boolean
+            rate:
+              type: [integer, "null"]
+              description: "K в 'принимается 1 из K', null если sampling никогда не включался."
+
+    ResultsSnapshotPoint:
+      type: object
+      required: [at, total_accepted, options]
+      properties:
+        at:
+          type: string
+          format: date-time
+        total_accepted:
+          type: integer
+        options:
+          type: array
+          items:
+            type: object
+            required: [option_id, count]
+            properties:
+              option_id:
+                type: string
+              count:
+                type: integer

@@ -136,9 +136,102 @@ doesn't log), memcached (no Lua, no atomic `SET NX` continuation).
   and cluster numbers are linearly extrapolated with the coefficient stated
   explicitly.
 
+## API contract
+
+The wire contract is fixed in `api/openapi.yaml` (OpenAPI 3.1, hand-written,
+validated with `npx @redocly/cli lint api/openapi.yaml`). It lives at the
+repo root (not under `backend/`) because `01-stack.md` frames it as the
+contract *with the frontend* — a boundary between two separate codebases.
+Rationale for the endpoint list and every non-obvious call is in
+`docs/ai/05-api-contract.md`; the two load-bearing decisions made there,
+not elsewhere:
+
+- **Vote token format**: stateless HMAC-signed opaque token
+  (`base64url(poll_id|issued_at|nonce).base64url(HMAC-SHA256(...))`),
+  verified locally at vote time with no Redis read at issuance. This closes
+  the "HMAC vs opaque-in-Redis" open question `01-stack.md` left open — an
+  opaque token pre-registered in Redis at issuance would collide with the
+  `SET NX` dedup check and break the first vote.
+- **`GET /v1/polls/{id}` is public once a poll is `scheduled`, not only once
+  `open`** — otherwise the CDN cache is cold exactly at broadcast start,
+  recreating the Coinbase-style collapse the CDN split was meant to prevent.
+
+Endpoints: public (`GET /v1/polls/{id}`, `POST /v1/polls/{id}/token`,
+`POST /v1/polls/{id}/votes`), admin (`POST|GET /v1/admin/polls`,
+`GET /v1/admin/polls/{id}`, `POST /v1/admin/polls/{id}/transitions` — one
+generic FSM-transition endpoint rather than separate schedule/open/close
+routes, `GET /v1/admin/polls/{id}/results[/timeseries]`), and internal
+(`POST /internal/warmup`, `GET /healthz`, `GET /metrics`). No poll
+PATCH/DELETE and no public results endpoint — deliberate, see the "what's
+deliberately out" table in `05-api-contract.md`.
+
+## Deduplication
+
+Fixed in `docs/ai/03-deduplication.md`. The core point, worth internalizing
+before touching vote-handling code: **the vote token and the IP rate limiter
+solve two different problems and neither substitutes for the other.**
+
+- **Token = identity** (dedup). Redis key `d:{poll_id}:{nonce}` (nonce = the
+  random component of the HMAC token, not the whole signed value), one
+  `SET NX EX` per token, enforced via the Lua script from `01-stack.md`. TTL
+  is **not** a flat duration from issuance — both `token.expires_at` and the
+  dedup-key TTL equal `poll.closes_at` (+60s grace), because a fixed offset
+  from issuance either outlives the voting window or expires before it
+  depending on when in the window the token was issued.
+- **IP rate limit = anti-flood**, not dedup. A rolling-window limit keyed by
+  IP cannot enforce "one vote per person" — CGNAT/shared-Wi-Fi puts many
+  real distinct voters behind one IP (blocking them is the R14 false-positive
+  cost), and a rolling window resets every window regardless, so it bounds
+  *rate* over the poll's 5-minute window, not a *count* for its lifetime.
+  It's applied to both `/token` and `/votes` (starving the flood at the
+  cheaper endpoint first) with a deliberately generous, unvalidated draft
+  threshold (60 req/10s per IP) — tune only after a k6 measurement, per the
+  same "generous by design" principle as the degradation ladder in
+  `02-load-model.md` §6.7.
+- Clearing cookies+localStorage or using incognito bypasses the token dedup
+  — accepted deliberately, this is exactly the R2 bar ("basic, not
+  adversarial"), not a bug to close.
+
+## Data model
+
+Fixed in `docs/ai/04-data-model.md`: 4 Postgres tables (`polls`,
+`poll_options`, `poll_result_snapshots`, `admin_audit_log`) and the full
+Redis key inventory (`poll:{id}:meta`, `poll:{id}:counts:{shard}`,
+`poll:{id}:rejected:{shard}`, `d:{poll_id}:{nonce}`, `rl:{poll_id}:{ip}`).
+The DDL and the updated vote-accept Lua script were both run against real
+Postgres 16 and Redis 7 in Docker while writing the doc, not just read over
+— worth knowing before trusting either without re-checking against whatever
+the schema has drifted to since:
+
+- **Gap this doc closed, not covered by `01`/`02`/`03`**: the vote handler
+  needs `poll.state`, `closes_at`, and the valid `option_id` range on every
+  vote, but `02-load-model.md` says the hot path never touches Postgres and
+  is exactly one Redis round-trip. Fix: `poll:{id}:meta` (a Redis HASH)
+  mirrors `state`/`closes_at`/`option_count`, and the vote-accept Lua script
+  reads it as part of the *same* `EVALSHA` — still one network round-trip,
+  just more Redis-internal commands inside that one call.
+- **`poll_options.id` (the wire `option_id`) is a small per-poll ordinal
+  (1..N), not a UUID** — it's a hot-path Redis hash field on every vote, so
+  keeping it short matters; global uniqueness doesn't, since options are
+  never referenced outside their poll.
+- **`polls.closes_at` is set by a trigger, not `GENERATED ALWAYS AS`.** The
+  generated-column version was tried first and actually fails on real
+  Postgres 16 — `timestamptz + interval` is `STABLE`, not `IMMUTABLE`, so
+  Postgres rejects it as a generation expression. A `BEFORE INSERT OR
+  UPDATE` trigger gives the same "app can't desync `closes_at` from
+  `opens_at`/`voting_window_seconds`" guarantee without that restriction.
+- **State-transition write order to Postgres vs. the Redis `poll:meta`
+  mirror is asymmetric, not "always Postgres-first" or always the reverse**:
+  opening a poll writes Postgres first then Redis (a lost Redis write just
+  delays voting start — safe); closing a poll writes Redis first then
+  Postgres (a lost Postgres write would otherwise leave Redis still
+  accepting votes past the real close — unsafe). `/internal/warmup`
+  doubles as a reconciliation point rather than adding a separate job.
+
 ## Open items (per docs/ai/README.md, not yet written)
 
-`03-deduplication.md` (dedup scheme, resolving the conflict with anonymity),
-`04-data-model.md` (schema, poll states, Redis key layout),
-`05-api-contract.md` (public + admin API), `adr/`, `sessions/` (AI dialogue
-logs including dead ends), `what-ai-got-wrong.md`.
+`adr/`, `sessions/` (AI dialogue logs including dead ends),
+`what-ai-got-wrong.md`. The sampling-mode (degradation level 2) activation
+mechanism is also explicitly unresolved — schema has room for it
+(`poll_result_snapshots.sampling_enabled/rate`) but no endpoint toggles it;
+see `04-data-model.md` §6.
