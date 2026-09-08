@@ -18,8 +18,10 @@ import (
 
 	"github.com/fallra1n/tvpoll/internal/cache"
 	"github.com/fallra1n/tvpoll/internal/config"
+	"github.com/fallra1n/tvpoll/internal/counter"
 	"github.com/fallra1n/tvpoll/internal/httpapi"
 	"github.com/fallra1n/tvpoll/internal/store/postgres"
+	"github.com/fallra1n/tvpoll/internal/store/redisstore"
 )
 
 func main() {
@@ -79,6 +81,8 @@ func run() error {
 		Redis:     rdb,
 		Polls:     pollStore,
 		PollCache: pollCache,
+		Dedup:     redisstore.NewDedupStore(rdb),
+		Counters:  counter.NewStore(),
 	}
 
 	mainSrv := &http.Server{

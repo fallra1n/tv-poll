@@ -111,6 +111,10 @@ func createPollHandler(deps Deps) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal", "failed to create poll")
 			return
 		}
+		// A poll created directly as scheduled (scheduled_at was given)
+		// must be visible to the vote/token cache immediately, not after
+		// the next 1s refresh tick — see cache.Cache.Put's doc comment.
+		deps.PollCache.Put(poll)
 
 		writeJSON(w, http.StatusCreated, newPollAdminResponse(poll))
 	}
@@ -236,6 +240,12 @@ func transitionPollHandler(deps Deps) http.HandlerFunc {
 			}
 			return
 		}
+		// Must be visible to the vote/token cache before this response
+		// even reaches the admin's browser, not after the next refresh
+		// tick — see cache.Cache.Put's doc comment (found via an
+		// end-to-end test: a vote fired immediately after scheduled ->
+		// open was wrongly rejected as "closed" without this).
+		deps.PollCache.Put(poll)
 
 		writeJSON(w, http.StatusOK, newPollAdminResponse(poll))
 	}

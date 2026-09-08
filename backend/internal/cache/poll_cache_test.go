@@ -200,6 +200,50 @@ func TestCache_Refresh_TracksTransitionToClosed(t *testing.T) {
 	}
 }
 
+// TestCache_Put_ImmediatelyVisible guards the fix for a real bug found
+// end-to-end: without Put, a vote arriving right after an admin's
+// scheduled -> open transition (before the next background refresh
+// tick) saw the stale cached "scheduled" state and was wrongly rejected
+// as closed.
+func TestCache_Put_ImmediatelyVisible(t *testing.T) {
+	loader := &fakeLoader{byID: map[uuid.UUID]domain.Poll{}}
+	c := New(loader, testLogger())
+
+	id := uuid.New()
+	c.Put(domain.Poll{ID: id, State: domain.PollOpen})
+
+	d, ok := c.GetCached(id)
+	if !ok {
+		t.Fatal("expected the poll to be visible immediately after Put, with no refresh")
+	}
+	if d.State != domain.PollOpen {
+		t.Errorf("State = %s, want open", d.State)
+	}
+	if loader.calls != 0 {
+		t.Errorf("expected Put to need zero loader calls, got %d", loader.calls)
+	}
+}
+
+func TestCache_Put_TracksActiveSet(t *testing.T) {
+	loader := &fakeLoader{byID: map[uuid.UUID]domain.Poll{}}
+	c := New(loader, testLogger())
+	id := uuid.New()
+
+	c.Put(domain.Poll{ID: id, State: domain.PollOpen})
+	if _, active := c.active[id]; !active {
+		t.Fatal("expected an open poll written via Put to be tracked active")
+	}
+
+	c.Put(domain.Poll{ID: id, State: domain.PollClosed})
+	if _, active := c.active[id]; active {
+		t.Fatal("expected a closed poll written via Put to be dropped from the active set")
+	}
+	d, ok := c.GetCached(id)
+	if !ok || d.State != domain.PollClosed {
+		t.Fatalf("expected the closed state to still be cached, got %+v ok=%v", d, ok)
+	}
+}
+
 func TestPollDefinition_OptionCount(t *testing.T) {
 	d := PollDefinition{Options: []domain.PollOption{{Ordinal: 1, Label: "a"}, {Ordinal: 2, Label: "b"}}}
 	if got := d.OptionCount(); got != 2 {

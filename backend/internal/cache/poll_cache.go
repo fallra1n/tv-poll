@@ -135,6 +135,35 @@ func (c *Cache) store(d PollDefinition) {
 	c.data[d.ID] = d
 }
 
+// Put makes p's latest known state visible to cache reads immediately,
+// without waiting for the next background refresh tick. Callers that
+// just wrote a state transition to Postgres (admin create/transition
+// handlers) call this right after — found necessary while exercising
+// the vote flow end-to-end: without it, a vote arriving in the up-to-
+// one-second gap between an admin's scheduled -> open transition and
+// the next refresh tick would see the stale cached "scheduled" state
+// and get rejected as "closed" — a false rejection of a real voter,
+// which is the wrong direction of error per R14 (docs/ai/00-task-
+// original.md) — the background refresh already accepts the opposite
+// staleness (accepting votes for up to one tick after a close) as the
+// correct side to err on; this closes the other direction.
+//
+// A poll that's scheduled/open is added to `active` exactly as refresh
+// would, so the grace-tick mechanism keeps tracking it into whatever
+// state it transitions to next, even though refresh didn't discover it
+// itself this time.
+func (c *Cache) Put(p domain.Poll) {
+	d := fromPoll(p)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.data[d.ID] = d
+	if d.State == domain.PollScheduled || d.State == domain.PollOpen {
+		c.active[d.ID] = struct{}{}
+	} else {
+		delete(c.active, d.ID)
+	}
+}
+
 // Run refreshes scheduled/open polls, plus whatever was scheduled/open
 // as of the previous tick (to catch its transition to closed), once per
 // interval until ctx is cancelled. Call this in a goroutine at startup.

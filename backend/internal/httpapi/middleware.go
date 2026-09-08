@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/fallra1n/tvpoll/internal/ratelimit"
 )
 
@@ -111,11 +113,17 @@ func bearerToken(r *http.Request) (string, bool) {
 // §6.7): 429 with a *jittered* Retry-After. The jitter is required, not
 // cosmetic — without it every throttled client retries after exactly the
 // same delay and the resulting synchronized retry wave becomes a second,
-// higher peak than the first. Shared by /token and /votes, which share
-// one rate limit bucket per IP (docs/ai/03-deduplication.md §3.1).
+// higher peak than the first. Shared by GET /v1/polls/{id}, /token, and
+// /votes.
+//
+// Cache-Control: no-store is set unconditionally — a 429 cached by a
+// shared proxy/CDN in front of any of these endpoints would keep telling
+// every other client behind that cache "too many requests" long after
+// the one client that triggered it backs off.
 func writeRateLimited(w http.ResponseWriter) {
 	retryAfter := 1 + rand.IntN(3) // 1..3s
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	w.Header().Set("Cache-Control", "no-store")
 	writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
 }
 
@@ -130,4 +138,11 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// voteRateLimitKey scopes the shared /token+/votes bucket to
+// (poll_id, ip) — see issueVoteTokenHandler's doc comment for why ip
+// alone isn't enough.
+func voteRateLimitKey(pollID uuid.UUID, r *http.Request) string {
+	return pollID.String() + ":" + clientIP(r)
 }

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -59,11 +60,25 @@ func newPollPublicResponse(d cache.PollDefinition) pollPublicResponse {
 // this endpoint needs something to cache before air time, not starting
 // exactly when the QR code appears on screen
 // (docs/ai/05-api-contract.md, "почему GET открыт уже в scheduled").
-func getPollHandler(deps Deps) http.HandlerFunc {
+//
+// limiter: added alongside the vote handler — this endpoint falls
+// through to Postgres on every cache miss (fetch-through, see
+// internal/cache), and unlike /token and /votes it started out with no
+// rate limit at all, which meant a flood of requests for bogus poll IDs
+// would hit Postgres on every single one. In production a CDN sits in
+// front of this response and absorbs that traffic
+// (docs/ai/02-load-model.md §6.1); locally, this is the only thing
+// standing in for it.
+func getPollHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := uuid.Parse(chi.URLParam(r, "pollId"))
 		if err != nil {
 			notFoundPoll(w)
+			return
+		}
+
+		if !limiter.Allow(voteRateLimitKey(id, r)) {
+			writeRateLimited(w)
 			return
 		}
 
@@ -110,17 +125,21 @@ type voteTokenResponse struct {
 // limiter is shared with castVoteHandler: docs/ai/03-deduplication.md
 // §3.1 requires one bucket per IP across both endpoints, not one each —
 // otherwise a script could still mint tokens as fast as it likes and
-// only get throttled once it tries to spend them.
+// only get throttled once it tries to spend them. The bucket key is
+// scoped to (poll_id, ip), not ip alone (docs/ai/04-data-model.md §2.4:
+// the original Redis key was `rl:{poll_id}:{ip}` for exactly this
+// reason) — otherwise one IP voting on two different polls would share a
+// single budget between them.
 func issueVoteTokenHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !limiter.Allow(clientIP(r)) {
-			writeRateLimited(w)
-			return
-		}
-
 		id, err := uuid.Parse(chi.URLParam(r, "pollId"))
 		if err != nil {
 			notFoundPoll(w)
+			return
+		}
+
+		if !limiter.Allow(voteRateLimitKey(id, r)) {
+			writeRateLimited(w)
 			return
 		}
 
@@ -185,4 +204,129 @@ func setVoteTokenCookie(w http.ResponseWriter, cfg config.Config, token string, 
 		SameSite: http.SameSiteNoneMode,
 		HttpOnly: false,
 	})
+}
+
+// dedupGrace pads the dedup key's TTL past closes_at
+// (docs/ai/03-deduplication.md §2.3): slack for in-flight requests and
+// clock drift between instances, not a security boundary.
+const dedupGrace = 60 * time.Second
+
+type voteRequest struct {
+	OptionID int `json:"option_id"`
+}
+
+type voteAcceptedResponse struct {
+	Status   string `json:"status"`
+	OptionID int    `json:"option_id"`
+}
+
+type voteRejectedResponse struct {
+	Status   string `json:"status"`
+	Reason   string `json:"reason"`
+	OptionID *int   `json:"option_id,omitempty"`
+}
+
+func writeVoteRejected(w http.ResponseWriter, status int, reason string, optionID *int) {
+	writeJSON(w, status, voteRejectedResponse{Status: "rejected", Reason: reason, OptionID: optionID})
+}
+
+// castVoteHandler implements POST /v1/polls/{pollId}/votes — the one
+// endpoint the backend must survive at peak load
+// (docs/ai/02-load-model.md §6.1). Check order mirrors this session's
+// plan exactly: rate limit (0 I/O) -> token signature (0 I/O) -> cached
+// poll definition (0 I/O in steady state) -> window/option validation
+// (0 I/O) -> exactly one Redis round-trip (the dedup claim) -> in-memory
+// counter increment (0 I/O).
+//
+// Deliberately reads the poll via GetCached, not the fetch-through Get
+// used by GET /v1/polls/{id} and /token: this is the one endpoint the
+// entire load model's numbers are about, and "never touches Postgres"
+// (docs/ai/02-load-model.md §4.2) should hold for it without a "well,
+// rarely" caveat. A cache miss here — a genuinely nonexistent poll, or
+// (rare, self-healing within one refresh tick) a vote arriving in the
+// sub-second window before the first background refresh after a fresh
+// process start — is answered as 404 rather than falling through to
+// Postgres.
+func castVoteHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		pollID, err := uuid.Parse(chi.URLParam(r, "pollId"))
+		if err != nil {
+			notFoundPoll(w)
+			return
+		}
+
+		if !limiter.Allow(voteRateLimitKey(pollID, r)) {
+			writeRateLimited(w)
+			return
+		}
+
+		wireToken, ok := voteTokenFromRequest(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "vote token missing")
+			return
+		}
+
+		now := time.Now()
+		secrets := []string{deps.Config.VoteTokenSecret, deps.Config.VoteTokenSecretPrev}
+		token, err := domain.VerifyVoteToken(wireToken, pollID, now, secrets)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "vote token invalid or expired")
+			return
+		}
+
+		def, ok := deps.PollCache.GetCached(pollID)
+		if !ok {
+			notFoundPoll(w)
+			return
+		}
+
+		// Re-checked here even though only `open` polls should be
+		// accepting votes: until auto-close exists, nothing else enforces
+		// this deadline, and even after it does, this is the same
+		// belt-and-suspenders check the original Lua design made
+		// (docs/ai/04-data-model.md §2.3: state OR closes_at violated ->
+		// closed) — a poll manually left open past its window must still
+		// stop accepting votes.
+		if def.State != domain.PollOpen || def.ClosesAt == nil || !now.Before(*def.ClosesAt) {
+			writeVoteRejected(w, http.StatusConflict, "closed", nil)
+			return
+		}
+
+		var req voteRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.OptionID < 1 || req.OptionID > def.OptionCount() {
+			writeError(w, http.StatusBadRequest, "invalid_option", "option_id does not exist in this poll")
+			return
+		}
+
+		ttl := time.Until(*def.ClosesAt) + dedupGrace
+		prevOptionID, accepted, err := deps.Dedup.TryClaim(r.Context(), pollID, token.NonceString(), req.OptionID, ttl)
+		if err != nil {
+			deps.Logger.Error("cast vote: redis dedup claim failed", "error", err)
+			writeError(w, http.StatusServiceUnavailable, "redis_unavailable", "voting is temporarily unavailable")
+			return
+		}
+
+		counters := deps.Counters.ForPoll(pollID, def.OptionCount())
+		if !accepted {
+			counters.RejectDuplicate()
+			writeVoteRejected(w, http.StatusConflict, "duplicate", &prevOptionID)
+			return
+		}
+
+		counters.AcceptVote(req.OptionID)
+		writeJSON(w, http.StatusCreated, voteAcceptedResponse{Status: "accepted", OptionID: req.OptionID})
+	}
+}
+
+// voteTokenFromRequest checks the X-Vote-Token header first, then the
+// vote_token cookie — either source is accepted
+// (docs/ai/01-stack.md, "Граница с фронтендом", п.2).
+func voteTokenFromRequest(r *http.Request) (string, bool) {
+	if h := r.Header.Get("X-Vote-Token"); h != "" {
+		return h, true
+	}
+	if c, err := r.Cookie("vote_token"); err == nil && c.Value != "" {
+		return c.Value, true
+	}
+	return "", false
 }

@@ -19,8 +19,10 @@ import (
 
 	"github.com/fallra1n/tvpoll/internal/cache"
 	"github.com/fallra1n/tvpoll/internal/config"
+	"github.com/fallra1n/tvpoll/internal/counter"
 	"github.com/fallra1n/tvpoll/internal/ratelimit"
 	"github.com/fallra1n/tvpoll/internal/store/postgres"
+	"github.com/fallra1n/tvpoll/internal/store/redisstore"
 )
 
 // Deps holds everything the routers need. It grows as handles are added
@@ -33,6 +35,8 @@ type Deps struct {
 	Redis     *redis.Client
 	Polls     *postgres.PollStore
 	PollCache *cache.Cache
+	Dedup     *redisstore.DedupStore
+	Counters  *counter.Store
 }
 
 // New builds the top-level handler for HTTPAddr (everything except
@@ -68,9 +72,9 @@ func New(deps Deps) http.Handler {
 	voteRateLimiter := ratelimit.New(deps.Config.RateLimitRPS, deps.Config.RateLimitBurst, 100_000)
 
 	r.Route("/v1/polls/{pollId}", func(pub chi.Router) {
-		pub.Get("/", getPollHandler(deps))
+		pub.Get("/", getPollHandler(deps, voteRateLimiter))
 		pub.Post("/token", issueVoteTokenHandler(deps, voteRateLimiter))
-		// Populated in step 6: POST /votes.
+		pub.Post("/votes", castVoteHandler(deps, voteRateLimiter))
 	})
 
 	r.Route("/v1/admin", func(admin chi.Router) {
