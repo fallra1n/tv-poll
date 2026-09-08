@@ -3,8 +3,10 @@ package httpapi
 import (
 	"crypto/subtle"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/fallra1n/tvpoll/internal/ratelimit"
@@ -103,6 +105,18 @@ func bearerToken(r *http.Request) (string, bool) {
 		return "", false
 	}
 	return h[len(prefix):], true
+}
+
+// writeRateLimited answers level-1 degradation (docs/ai/02-load-model.md
+// §6.7): 429 with a *jittered* Retry-After. The jitter is required, not
+// cosmetic — without it every throttled client retries after exactly the
+// same delay and the resulting synchronized retry wave becomes a second,
+// higher peak than the first. Shared by /token and /votes, which share
+// one rate limit bucket per IP (docs/ai/03-deduplication.md §3.1).
+func writeRateLimited(w http.ResponseWriter) {
+	retryAfter := 1 + rand.IntN(3) // 1..3s
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
 }
 
 // clientIP takes the connection's remote address, not

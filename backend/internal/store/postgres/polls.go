@@ -158,6 +158,50 @@ func (s *PollStore) GetByID(ctx context.Context, id uuid.UUID) (domain.Poll, err
 	return getPollByID(ctx, s.db, id)
 }
 
+// ListByStateOrID returns every poll whose state is in states, unioned
+// with every poll whose id is in ids — used by internal/cache's refresh
+// loop to pull in both "newly relevant" polls (state filter) and
+// "already cached, re-check for a state change" polls (id filter) in
+// one query. ids/states may be empty; an empty array parameter simply
+// matches nothing on that side of the OR.
+//
+// IDs and states are passed as text/uuid arrays cast in SQL rather than
+// relying on pgx's array codec for []uuid.UUID or a custom string-based
+// slice type — []string round-trips through pgx unambiguously, so this
+// sidesteps that question entirely instead of assuming an answer.
+func (s *PollStore) ListByStateOrID(ctx context.Context, states []domain.PollState, ids []uuid.UUID) ([]domain.Poll, error) {
+	stateStrs := make([]string, len(states))
+	for i, st := range states {
+		stateStrs[i] = string(st)
+	}
+	idStrs := make([]string, len(ids))
+	for i, id := range ids {
+		idStrs[i] = id.String()
+	}
+
+	rows, err := s.db.Query(ctx,
+		pollWithOptionsSelect+" WHERE p.state = ANY($1::text[]) OR p.id = ANY($2::text[]::uuid[])",
+		stateStrs, idStrs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list polls by state or id: %w", err)
+	}
+	defer rows.Close()
+
+	var polls []domain.Poll
+	for rows.Next() {
+		p, err := scanPollWithOptions(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan poll: %w", err)
+		}
+		polls = append(polls, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate polls: %w", err)
+	}
+	return polls, nil
+}
+
 // ListPollsFilter is nil-State for "no filter"; Limit/Offset are always
 // applied (the handler defaults them per api/openapi.yaml: limit default
 // 20, max 100).

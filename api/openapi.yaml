@@ -40,6 +40,15 @@ paths:
         обслуживает CDN, а не бэкенд напрямую (docs/ai/02-load-model.md §6.1).
         Опрос в состоянии draft не существует для внешнего мира — 404,
         чтобы не спойлерить вопрос до публикации.
+
+
+        Ответ намеренно не содержит `state`: он меняется в течение жизни
+        опроса (scheduled → open → closed), а этот ответ кешируется на
+        сутки как неизменяемый — поле, которое меняется, ломало бы саму
+        предпосылку кеширования. Клиент определяет, идёт ли сейчас приём
+        голосов, сравнивая текущее время с `opens_at`/`closes_at`; сервер
+        остаётся единственным источником истины в момент самого запроса
+        `POST /votes`, который не полагается на этот кеш.
       parameters:
         - $ref: '#/components/parameters/PollId'
       responses:
@@ -49,13 +58,27 @@ paths:
             Cache-Control:
               schema:
                 type: string
-                example: public, max-age=604800, immutable
+                example: public, max-age=86400, immutable
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/PollPublic'
         '404':
-          $ref: '#/components/responses/NotFound'
+          description: >
+            Опрос не найден или ещё не опубликован (state=draft).
+            `Cache-Control: no-store` — намеренно, в отличие от 200: без
+            этого CDN мог бы закешировать 404 для опроса, который
+            публикуется через секунду, и продолжать отдавать его уже
+            после публикации.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /v1/polls/{pollId}/token:
     post:
@@ -66,7 +89,10 @@ paths:
         Первый шаг двухшагового флоу голосования (docs/ai/01-stack.md, раздел
         про k6): токен нужно получить один раз при открытии страницы, до
         отправки голоса. Токен — самоподписанный (HMAC-SHA256 над
-        poll_id+issued_at+nonce), выдача не требует обращения к Redis —
+        poll_id+expires_at+nonce, где expires_at = closes_at опроса на
+        момент выдачи — не issued_at, иначе проверка на голосовании не
+        закрывалась бы локально одним сравнением, см.
+        docs/ai/05-api-contract.md), выдача не требует обращения к Redis —
         обращение к Redis происходит только при самом голосовании (проверка
         dedup-ключа), см. docs/ai/05-api-contract.md.
 
@@ -509,9 +535,9 @@ components:
           minLength: 1
           maxLength: 200
 
-    PollPublic:
+    PollDefinition:
       type: object
-      required: [id, question, options, state]
+      required: [id, question, options]
       properties:
         id:
           type: string
@@ -522,29 +548,56 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PollOption'
-        state:
-          $ref: '#/components/schemas/PollState'
-        opens_at:
-          type: [string, "null"]
-          format: date-time
-        closes_at:
-          type: [string, "null"]
-          format: date-time
-          description: >
-            Известно только пока state=open (окно приёма определено).
-            Дефолт длины окна — 5 минут (docs/ai/02-load-model.md §6.4),
-            это НЕ длительность ролика.
+
+    PollPublic:
+      description: >
+        Намеренно без `state` — см. пояснение в description у
+        GET /v1/polls/{pollId}. Любой опрос, для которого этот объект
+        вообще отдаётся (не 404), уже прошёл scheduled, так что
+        opens_at/closes_at всегда заполнены, не null.
+      allOf:
+        - $ref: '#/components/schemas/PollDefinition'
+        - type: object
+          required: [opens_at, closes_at]
+          properties:
+            opens_at:
+              type: string
+              format: date-time
+              description: >
+                Равно scheduled_at на момент публикации — единственный вход
+                для closes_at (докрутка триггером в Postgres,
+                docs/ai/04-data-model.md §1.1), поэтому оба поля иммутабельны
+                и кешируемы уже с состояния scheduled, а не только с open.
+            closes_at:
+              type: string
+              format: date-time
+              description: >
+                Дефолт длины окна — 5 минут (docs/ai/02-load-model.md §6.4),
+                это НЕ длительность ролика. Фактическое открытие (переход в
+                open) может случиться на секунды позже opens_at — на это
+                значение не влияет, окно голосования фиксируется в момент
+                планирования, а не в момент фактического старта.
 
     PollAdmin:
       allOf:
-        - $ref: '#/components/schemas/PollPublic'
+        - $ref: '#/components/schemas/PollDefinition'
         - type: object
-          required: [scheduled_at, voting_window_seconds, created_at, updated_at]
+          required: [state, scheduled_at, opens_at, closes_at, voting_window_seconds, created_at, updated_at]
           properties:
+            state:
+              $ref: '#/components/schemas/PollState'
             scheduled_at:
               type: [string, "null"]
               format: date-time
               description: Плановое время эфира — вход для /internal/warmup.
+            opens_at:
+              type: [string, "null"]
+              format: date-time
+              description: Равно null, пока draft-опрос не запланирован.
+            closes_at:
+              type: [string, "null"]
+              format: date-time
+              description: Равно null, пока draft-опрос не запланирован.
             voting_window_seconds:
               type: integer
               description: Длина окна приёма голосов от момента open. По умолчанию 300с.

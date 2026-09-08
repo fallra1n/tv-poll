@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/fallra1n/tvpoll/internal/cache"
 	"github.com/fallra1n/tvpoll/internal/config"
 	"github.com/fallra1n/tvpoll/internal/ratelimit"
 	"github.com/fallra1n/tvpoll/internal/store/postgres"
@@ -26,11 +27,12 @@ import (
 // (poll store, vote store, caches, ...); kept as one struct so handlers
 // take a single dependency, not a long parameter list.
 type Deps struct {
-	Config config.Config
-	Logger *slog.Logger
-	DB     *pgxpool.Pool
-	Redis  *redis.Client
-	Polls  *postgres.PollStore
+	Config    config.Config
+	Logger    *slog.Logger
+	DB        *pgxpool.Pool
+	Redis     *redis.Client
+	Polls     *postgres.PollStore
+	PollCache *cache.Cache
 }
 
 // New builds the top-level handler for HTTPAddr (everything except
@@ -55,8 +57,20 @@ func New(deps Deps) http.Handler {
 	// single static token with no lockout/rotation UX to protect.
 	adminFailLimiter := ratelimit.New(1, 10, 10_000)
 
+	// Shared across /token and /votes — one bucket per IP for both, per
+	// docs/ai/03-deduplication.md §3.1 ("Лимит общий для /token и
+	// /votes"): rate-limiting only one of the two would let a script mint
+	// tokens as fast as it likes and only get throttled at the second
+	// endpoint. Threshold and burst come from config (defaults: 6 rps /
+	// burst 60, matching the draft "60 req/10s per IP" from that doc);
+	// maxKeys bounds memory across however many distinct IPs a broadcast
+	// brings, per internal/ratelimit's own doc comment.
+	voteRateLimiter := ratelimit.New(deps.Config.RateLimitRPS, deps.Config.RateLimitBurst, 100_000)
+
 	r.Route("/v1/polls/{pollId}", func(pub chi.Router) {
-		// Populated in later steps: GET /, POST /token, POST /votes.
+		pub.Get("/", getPollHandler(deps))
+		pub.Post("/token", issueVoteTokenHandler(deps, voteRateLimiter))
+		// Populated in step 6: POST /votes.
 	})
 
 	r.Route("/v1/admin", func(admin chi.Router) {

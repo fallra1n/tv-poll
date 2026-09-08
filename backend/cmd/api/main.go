@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/fallra1n/tvpoll/internal/cache"
 	"github.com/fallra1n/tvpoll/internal/config"
 	"github.com/fallra1n/tvpoll/internal/httpapi"
 	"github.com/fallra1n/tvpoll/internal/store/postgres"
@@ -64,12 +65,20 @@ func run() error {
 		return err
 	}
 
+	pollStore := postgres.NewPollStore(db)
+	pollCache := cache.New(pollStore, logger)
+	// Refreshes scheduled/open polls every second so they're warm before
+	// their voting window opens — see internal/cache's doc comment for
+	// why this bounds itself instead of caching every poll forever.
+	go pollCache.Run(ctx, time.Second)
+
 	deps := httpapi.Deps{
-		Config: cfg,
-		Logger: logger,
-		DB:     db,
-		Redis:  rdb,
-		Polls:  postgres.NewPollStore(db),
+		Config:    cfg,
+		Logger:    logger,
+		DB:        db,
+		Redis:     rdb,
+		Polls:     pollStore,
+		PollCache: pollCache,
 	}
 
 	mainSrv := &http.Server{
