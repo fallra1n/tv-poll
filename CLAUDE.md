@@ -4,11 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This repository is in the **planning stage**. `backend/` and `frontend/` are
-empty directories — no code has been written yet. The only substantive
-content is the architecture/decision record under `docs/ai/`. Do not assume
-any build/lint/test tooling exists until it's actually added; check the
-directories before running commands.
+Both `backend/` (Go, `make up` via docker-compose) and `frontend/`
+(Bun/React, see `frontend/README.md`) are implemented, verified against each
+other with a live `make up` + browser pass, and documented under `docs/ai/`
+(including `sessions/` and `what-ai-got-wrong.md`). `frontend/` is not yet
+committed to git as of this writing — check `git status` before assuming
+either side reflects what's on disk. Tooling exists for both (`go test`,
+`bun run lint`/`typecheck`/`test`/`test:e2e`) — run it rather than assuming
+state from docs, which have already been caught drifting from the working
+tree at least once (see `docs/ai/what-ai-got-wrong.md`).
 
 ## What this is
 

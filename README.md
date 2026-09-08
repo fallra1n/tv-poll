@@ -227,6 +227,35 @@ RPS to test that directly. `75,000 / 13,000 ≈ 6` instances at the measured
 ceiling, `× 1.5` headroom (the same margin the docs apply everywhere) `≈ 9`
 instances — in the same range as the original 8-instance estimate.
 
+## Frontend
+
+`frontend/` is a separate Bun/React 19 codebase, built only against
+[`api/openapi.yaml`](api/openapi.yaml) — see
+[`docs/ai/06-frontend.md`](docs/ai/06-frontend.md) for the architecture
+rationale and [`frontend/README.md`](frontend/README.md) for the full command
+list.
+
+```bash
+cd frontend
+bun install
+bun run api:types   # generate src/lib/api/schema.generated.ts from ../api/openapi.yaml
+bun run dev          # http://localhost:3000, with the backend from `make up` at :8080
+```
+
+Two HTML entrypoints, built and cached independently:
+
+- `/polls/{pollId}` — the public voting page. No router, no admin code, no
+  Recharts in this bundle — this is the page up to ~28M devices could load
+  per broadcast (`docs/ai/02-load-model.md`), so it stays minimal.
+- `/admin/*` — poll management, FSM transitions, and results/timeseries
+  charts, Bearer-token gated.
+
+**CDN boundary**: `frontend/dist/` is meant to be served from a static
+CDN/edge, never from this Go service — only `POST` votes and the two GETs
+that need CORS hit `backend/` directly. See `frontend/README.md`'s CDN
+section for the exact fallback rewrite rules and cache headers a real deploy
+needs.
+
 ## Project layout
 
 ```
