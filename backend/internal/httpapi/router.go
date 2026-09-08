@@ -18,6 +18,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/fallra1n/tvpoll/internal/config"
+	"github.com/fallra1n/tvpoll/internal/ratelimit"
+	"github.com/fallra1n/tvpoll/internal/store/postgres"
 )
 
 // Deps holds everything the routers need. It grows as handles are added
@@ -28,6 +30,7 @@ type Deps struct {
 	Logger *slog.Logger
 	DB     *pgxpool.Pool
 	Redis  *redis.Client
+	Polls  *postgres.PollStore
 }
 
 // New builds the top-level handler for HTTPAddr (everything except
@@ -43,17 +46,30 @@ func New(deps Deps) http.Handler {
 
 	r.Get("/healthz", healthzHandler(deps))
 
+	// Shared by every adminAuth-guarded router below: throttles repeated
+	// *failed* bearer-token attempts per IP (review finding C8 —
+	// subtle.ConstantTimeCompare defends the comparison itself against a
+	// timing side-channel, not the endpoint against brute force). Kept
+	// deliberately rough — a handful of failed attempts per second is far
+	// above any legitimate typo rate and far below what matters for a
+	// single static token with no lockout/rotation UX to protect.
+	adminFailLimiter := ratelimit.New(1, 10, 10_000)
+
 	r.Route("/v1/polls/{pollId}", func(pub chi.Router) {
 		// Populated in later steps: GET /, POST /token, POST /votes.
 	})
 
 	r.Route("/v1/admin", func(admin chi.Router) {
-		admin.Use(adminAuth(deps.Config.AdminToken))
-		// Populated in later steps: polls CRUD-ish + transitions + results.
+		admin.Use(adminAuth(deps.Config.AdminToken, adminFailLimiter))
+		admin.Post("/polls", createPollHandler(deps))
+		admin.Get("/polls", listPollsHandler(deps))
+		admin.Get("/polls/{pollId}", getPollAdminHandler(deps))
+		admin.Post("/polls/{pollId}/transitions", transitionPollHandler(deps))
+		// Populated in later steps: results.
 	})
 
 	r.Route("/internal", func(internal chi.Router) {
-		internal.Use(adminAuth(deps.Config.AdminToken))
+		internal.Use(adminAuth(deps.Config.AdminToken, adminFailLimiter))
 		// Populated in step 9: POST /warmup.
 	})
 

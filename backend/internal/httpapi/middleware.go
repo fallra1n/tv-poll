@@ -3,8 +3,11 @@ package httpapi
 import (
 	"crypto/subtle"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
+
+	"github.com/fallra1n/tvpoll/internal/ratelimit"
 )
 
 // requestLogger logs one line per request at Info, with no per-vote
@@ -71,17 +74,24 @@ func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 
 // adminAuth checks the static bearer token with a constant-time compare
 // (docs/ai/01-stack.md: subtle.ConstantTimeCompare, not ==, to avoid a
-// timing side-channel on the token comparison).
-func adminAuth(token string) func(http.Handler) http.Handler {
+// timing side-channel on the token comparison). failLimiter throttles
+// only the failure path per source IP — legitimate authenticated admin
+// traffic stays unlimited, matching "admin has auth but no rate limit"
+// (docs/ai/01-stack.md).
+func adminAuth(token string, failLimiter *ratelimit.Limiter) func(http.Handler) http.Handler {
 	want := []byte(token)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			got, ok := bearerToken(r)
-			if !ok || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
-				writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid admin bearer token")
+			if ok && subtle.ConstantTimeCompare([]byte(got), want) == 1 {
+				next.ServeHTTP(w, r)
 				return
 			}
-			next.ServeHTTP(w, r)
+			if !failLimiter.Allow(clientIP(r)) {
+				writeError(w, http.StatusTooManyRequests, "rate_limited", "too many failed authorization attempts")
+				return
+			}
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid admin bearer token")
 		})
 	}
 }
@@ -93,4 +103,17 @@ func bearerToken(r *http.Request) (string, bool) {
 		return "", false
 	}
 	return h[len(prefix):], true
+}
+
+// clientIP takes the connection's remote address, not
+// X-Forwarded-For/X-Real-IP — this process isn't yet configured with a
+// trusted-proxy allowlist, and trusting a client-supplied header for
+// rate-limit keys without one would let it be spoofed to evade the limit
+// entirely.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }

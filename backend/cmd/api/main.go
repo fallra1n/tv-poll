@@ -18,6 +18,7 @@ import (
 
 	"github.com/fallra1n/tvpoll/internal/config"
 	"github.com/fallra1n/tvpoll/internal/httpapi"
+	"github.com/fallra1n/tvpoll/internal/store/postgres"
 )
 
 func main() {
@@ -68,6 +69,7 @@ func run() error {
 		Logger: logger,
 		DB:     db,
 		Redis:  rdb,
+		Polls:  postgres.NewPollStore(db),
 	}
 
 	mainSrv := &http.Server{

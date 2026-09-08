@@ -491,7 +491,12 @@ components:
       required: [id, label]
       properties:
         id:
-          type: string
+          type: integer
+          minimum: 1
+          description: >
+            Порядковый номер варианта в опросе (1..N), не UUID — это
+            хэш-поле на горячем пути голосования, см.
+            docs/ai/04-data-model.md §1.2.
         label:
           type: string
 
@@ -607,7 +612,8 @@ components:
       required: [option_id]
       properties:
         option_id:
-          type: string
+          type: integer
+          minimum: 1
 
     VoteAccepted:
       type: object
@@ -617,7 +623,8 @@ components:
           type: string
           enum: [accepted]
         option_id:
-          type: string
+          type: integer
+          minimum: 1
 
     VoteRejected:
       type: object
@@ -659,7 +666,8 @@ components:
             required: [option_id, label, count]
             properties:
               option_id:
-                type: string
+                type: integer
+                minimum: 1
               label:
                 type: string
               count:
@@ -701,6 +709,7 @@ components:
             required: [option_id, count]
             properties:
               option_id:
-                type: string
+                type: integer
+                minimum: 1
               count:
                 type: integer
