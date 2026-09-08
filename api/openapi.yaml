@@ -690,6 +690,16 @@ components:
           type: string
           enum: [duplicate, closed, rate_limited]
           description: Совпадает со значениями метки reason у votes_rejected_total (docs/ai/01-stack.md).
+        option_id:
+          type: integer
+          minimum: 1
+          description: >
+            Присутствует только при reason=duplicate: вариант, который был
+            засчитан первым (успешным) голосованием этим токеном. Позволяет
+            клиенту, потерявшему ответ на первый POST и повторившему запрос
+            тем же токеном, увидеть «уже засчитан вариант X» вместо голого
+            конфликта — dedup-ключ в Redis хранит option_id, а не флаг
+            (docs/ai/03-deduplication.md §2.1).
 
     PollResults:
       type: object
