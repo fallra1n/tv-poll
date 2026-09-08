@@ -77,6 +77,13 @@ func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
 				w.Header().Set("Vary", "Origin")
+				// Retry-After isn't on the CORS response-header safelist,
+				// so without this the frontend's rate-limit backoff can
+				// only ever see a stripped header and falls back to a
+				// guessed delay (found by running the frontend against
+				// this backend in a browser, not by any unit test — see
+				// docs/ai/what-ai-got-wrong.md).
+				w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 			}
 			if r.Method == http.MethodOptions {
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -122,7 +129,7 @@ func bearerToken(r *http.Request) (string, bool) {
 	return h[len(prefix):], true
 }
 
-// writeRateLimited answers level-1 degradation (docs/ai/02-load-model.md
+// setRateLimitHeaders answers level-1 degradation (docs/ai/02-load-model.md
 // §6.7): 429 with a *jittered* Retry-After. The jitter is required, not
 // cosmetic — without it every throttled client retries after exactly the
 // same delay and the resulting synchronized retry wave becomes a second,
@@ -133,10 +140,17 @@ func bearerToken(r *http.Request) (string, bool) {
 // shared proxy/CDN in front of any of these endpoints would keep telling
 // every other client behind that cache "too many requests" long after
 // the one client that triggered it backs off.
-func writeRateLimited(w http.ResponseWriter) {
+func setRateLimitHeaders(w http.ResponseWriter) {
 	retryAfter := 1 + rand.IntN(3) // 1..3s
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	w.Header().Set("Cache-Control", "no-store")
+}
+
+// writeRateLimited is the generic Error-envelope 429, used by
+// GET /v1/polls/{id} and POST /token — api/openapi.yaml documents both
+// via the shared TooManyRequests response, which is the Error schema.
+func writeRateLimited(w http.ResponseWriter) {
+	setRateLimitHeaders(w)
 	writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
 }
 

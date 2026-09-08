@@ -231,6 +231,18 @@ func writeVoteRejected(w http.ResponseWriter, status int, reason string, optionI
 	writeJSON(w, status, voteRejectedResponse{Status: "rejected", Reason: reason, OptionID: optionID})
 }
 
+// writeVoteRateLimited answers 429 on POST /votes specifically —
+// api/openapi.yaml declares this endpoint's 429 body as VoteRejected
+// (reason=rate_limited), unlike the Error envelope used by GET
+// /v1/polls/{id} and POST /token's 429 (writeRateLimited). Found by
+// diffing the spec against this handler, not by any test — the
+// generated TS client types this response as VoteRejected, and until
+// this fix it never matched at runtime (docs/ai/what-ai-got-wrong.md).
+func writeVoteRateLimited(w http.ResponseWriter) {
+	setRateLimitHeaders(w)
+	writeVoteRejected(w, http.StatusTooManyRequests, "rate_limited", nil)
+}
+
 // castVoteHandler implements POST /v1/polls/{pollId}/votes — the one
 // endpoint the backend must survive at peak load
 // (docs/ai/02-load-model.md §6.1). Check order mirrors this session's
@@ -261,7 +273,7 @@ func castVoteHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 
 		if !limiter.Allow(voteRateLimitKey(pollID, r)) {
 			metrics.VotesRejected.WithLabelValues("rate_limited").Inc()
-			writeRateLimited(w)
+			writeVoteRateLimited(w)
 			return
 		}
 
