@@ -1,0 +1,56 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+  },
+  "plugins": [
+    "typescript",
+    "unicorn",
+    "oxc",
+    "react",
+    "jsx-a11y",
+    "import",
+    "promise"
+  ],
+  "rules": {
+    "curly": "error",
+    "eqeqeq": "error",
+    "import/no-duplicates": "error",
+    "import/no-unassigned-import": "off",
+    "no-debugger": "error",
+    "no-var": "error",
+    "prefer-const": "error",
+    "react/jsx-boolean-value": "error",
+    "react/no-object-type-as-default-prop": "off",
+    "react/react-in-jsx-scope": "off",
+    "react/self-closing-comp": "error",
+    "typescript/consistent-type-imports": "error",
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "error",
+    "unicorn/prefer-node-protocol": "error"
+  },
+  "env": {
+    "browser": true,
+    "node": true
+  },
+  "ignorePatterns": ["dist/**", "src/lib/api/schema.generated.ts"],
+  "options": {
+    "maxWarnings": 0
+  },
+  "overrides": [
+    {
+      "files": ["src/components/ui/label.tsx"],
+      "rules": {
+        "jsx-a11y/label-has-associated-control": "off"
+      }
+    },
+    {
+      "files": ["src/lib/config.ts"],
+      "rules": {
+        "no-underscore-dangle": "off"
+      }
+    }
+  ]
+}
