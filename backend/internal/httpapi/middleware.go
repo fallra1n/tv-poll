@@ -11,8 +11,21 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/fallra1n/tvpoll/internal/metrics"
 	"github.com/fallra1n/tvpoll/internal/ratelimit"
 )
+
+// inflightRequests tracks in-progress requests for observing saturation
+// (docs/ai/01-stack.md's inflight_requests gauge) — applied to every
+// router, not just the vote path, since saturation on the admin or
+// public GET routers is just as worth seeing.
+func inflightRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metrics.InflightRequests.Inc()
+		defer metrics.InflightRequests.Dec()
+		next.ServeHTTP(w, r)
+	})
+}
 
 // requestLogger logs one line per request at Info, with no per-vote
 // payload logging on the hot path (docs/ai/01-stack.md: "на горячем пути

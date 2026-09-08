@@ -37,6 +37,7 @@ type Deps struct {
 	PollCache *cache.Cache
 	Dedup     *redisstore.DedupStore
 	Counters  *counter.Store
+	Snapshots *postgres.SnapshotStore
 }
 
 // New builds the top-level handler for HTTPAddr (everything except
@@ -47,6 +48,7 @@ func New(deps Deps) http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 	r.Use(requestLogger(deps.Logger))
+	r.Use(inflightRequests)
 	r.Use(corsMiddleware(deps.Config.CORSAllowedOrigins))
 	r.Use(middleware.Timeout(10 * time.Second))
 
@@ -83,12 +85,13 @@ func New(deps Deps) http.Handler {
 		admin.Get("/polls", listPollsHandler(deps))
 		admin.Get("/polls/{pollId}", getPollAdminHandler(deps))
 		admin.Post("/polls/{pollId}/transitions", transitionPollHandler(deps))
-		// Populated in later steps: results.
+		admin.Get("/polls/{pollId}/results", getPollResultsHandler(deps))
+		admin.Get("/polls/{pollId}/results/timeseries", getPollResultsTimeseriesHandler(deps))
 	})
 
 	r.Route("/internal", func(internal chi.Router) {
 		internal.Use(adminAuth(deps.Config.AdminToken, adminFailLimiter))
-		// Populated in step 9: POST /warmup.
+		internal.Post("/warmup", warmupHandler(deps))
 	})
 
 	return r

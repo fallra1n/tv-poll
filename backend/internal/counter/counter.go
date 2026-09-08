@@ -38,6 +38,43 @@ func (pc *PollCounters) RejectRateLimited() {
 	pc.RejectedRateLimited.Add(1)
 }
 
+// SwapDeltas atomically reads and resets every counter, returning
+// whatever had accumulated since the last call (or since creation).
+// Used by the background flusher — the returned values are what it
+// should HINCRBY into Redis.
+//
+// Not a single atomic transaction across all fields: a vote landing on
+// option i in the instant between swapping field i and field i+1 is
+// simply picked up by the next flush instead of this one. It's still
+// counted exactly once, just possibly one flush interval later — the
+// same eventual-consistency bound already accepted everywhere else in
+// this design (docs/ai/02-load-model.md §6.6).
+func (pc *PollCounters) SwapDeltas() (accepted []int64, rejectedDuplicate, rejectedRateLimited int64) {
+	accepted = make([]int64, len(pc.Accepted))
+	for i := range pc.Accepted {
+		accepted[i] = pc.Accepted[i].Swap(0)
+	}
+	return accepted, pc.RejectedDuplicate.Swap(0), pc.RejectedRateLimited.Swap(0)
+}
+
+// RestoreDeltas adds previously-swapped-out deltas back. Used when a
+// flush attempt fails after already swapping the deltas out — a Redis
+// hiccup must delay counts reaching Redis, not lose the votes that were
+// about to be flushed.
+func (pc *PollCounters) RestoreDeltas(accepted []int64, rejectedDuplicate, rejectedRateLimited int64) {
+	for i, d := range accepted {
+		if d != 0 {
+			pc.Accepted[i].Add(d)
+		}
+	}
+	if rejectedDuplicate != 0 {
+		pc.RejectedDuplicate.Add(rejectedDuplicate)
+	}
+	if rejectedRateLimited != 0 {
+		pc.RejectedRateLimited.Add(rejectedRateLimited)
+	}
+}
+
 // Store holds one *PollCounters per poll, created lazily on first use.
 // A sync.Map fits the access pattern exactly: a handful of distinct keys
 // (only ever one poll is actually live at a time,
@@ -63,4 +100,14 @@ func (s *Store) ForPoll(pollID uuid.UUID, optionCount int) *PollCounters {
 	pc := &PollCounters{Accepted: make([]atomic.Int64, optionCount)}
 	actual, _ := s.polls.LoadOrStore(pollID, pc)
 	return actual.(*PollCounters)
+}
+
+// Range calls fn for every poll currently tracked. fn should be quick —
+// it runs while walking the underlying sync.Map, concurrently with
+// votes still landing on whichever poll fn is currently visiting.
+func (s *Store) Range(fn func(pollID uuid.UUID, pc *PollCounters)) {
+	s.polls.Range(func(key, value any) bool {
+		fn(key.(uuid.UUID), value.(*PollCounters))
+		return true
+	})
 }

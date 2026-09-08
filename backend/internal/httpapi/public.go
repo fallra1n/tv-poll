@@ -13,6 +13,7 @@ import (
 	"github.com/fallra1n/tvpoll/internal/cache"
 	"github.com/fallra1n/tvpoll/internal/config"
 	"github.com/fallra1n/tvpoll/internal/domain"
+	"github.com/fallra1n/tvpoll/internal/metrics"
 	"github.com/fallra1n/tvpoll/internal/ratelimit"
 )
 
@@ -249,6 +250,9 @@ func writeVoteRejected(w http.ResponseWriter, status int, reason string, optionI
 // Postgres.
 func castVoteHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		defer func() { metrics.VoteHandlerDuration.Observe(time.Since(start).Seconds()) }()
+
 		pollID, err := uuid.Parse(chi.URLParam(r, "pollId"))
 		if err != nil {
 			notFoundPoll(w)
@@ -256,6 +260,7 @@ func castVoteHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 		}
 
 		if !limiter.Allow(voteRateLimitKey(pollID, r)) {
+			metrics.VotesRejected.WithLabelValues("rate_limited").Inc()
 			writeRateLimited(w)
 			return
 		}
@@ -288,6 +293,7 @@ func castVoteHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 		// closed) — a poll manually left open past its window must still
 		// stop accepting votes.
 		if def.State != domain.PollOpen || def.ClosesAt == nil || !now.Before(*def.ClosesAt) {
+			metrics.VotesRejected.WithLabelValues("closed").Inc()
 			writeVoteRejected(w, http.StatusConflict, "closed", nil)
 			return
 		}
@@ -309,11 +315,13 @@ func castVoteHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 		counters := deps.Counters.ForPoll(pollID, def.OptionCount())
 		if !accepted {
 			counters.RejectDuplicate()
+			metrics.VotesRejected.WithLabelValues("duplicate").Inc()
 			writeVoteRejected(w, http.StatusConflict, "duplicate", &prevOptionID)
 			return
 		}
 
 		counters.AcceptVote(req.OptionID)
+		metrics.VotesAccepted.Inc()
 		writeJSON(w, http.StatusCreated, voteAcceptedResponse{Status: "accepted", OptionID: req.OptionID})
 	}
 }

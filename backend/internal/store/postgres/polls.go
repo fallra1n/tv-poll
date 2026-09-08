@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -308,4 +309,57 @@ func (s *PollStore) TransitionPoll(ctx context.Context, id uuid.UUID, req domain
 		return domain.Poll{}, fmt.Errorf("commit tx: %w", err)
 	}
 	return p, nil
+}
+
+// ListSnapshotCandidateIDs returns polls the snapshotter should still be
+// writing snapshots for: currently open, or closed more recently than
+// `since`. The latter half is review finding B2 — without it, a poll
+// closing between one snapshot tick and the next would lose whatever
+// votes arrived in that last second, since the tick that would have
+// captured them runs after the poll has already left `open` and (before
+// this) would have already been dropped from consideration.
+func (s *PollStore) ListSnapshotCandidateIDs(ctx context.Context, since time.Time) ([]uuid.UUID, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT id FROM polls
+		WHERE state = 'open'
+		   OR (state = 'closed' AND closed_at IS NOT NULL AND closed_at > $1)
+	`, since)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshot candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan snapshot candidate: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ListDuePolls returns polls still `scheduled` whose scheduled_at has
+// already arrived — review finding B4: without something transitioning
+// these to open automatically, a human has to click "open" in the exact
+// second the spot airs, defeating the point of scheduling in advance.
+func (s *PollStore) ListDuePolls(ctx context.Context, now time.Time) ([]uuid.UUID, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT id FROM polls WHERE state = 'scheduled' AND scheduled_at <= $1
+	`, now)
+	if err != nil {
+		return nil, fmt.Errorf("list due polls: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan due poll: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
