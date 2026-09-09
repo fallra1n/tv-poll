@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -102,7 +103,7 @@ func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 // only the failure path per source IP — legitimate authenticated admin
 // traffic stays unlimited, matching "admin has auth but no rate limit"
 // (docs/ai/01-stack.md).
-func adminAuth(token string, failLimiter *ratelimit.Limiter) func(http.Handler) http.Handler {
+func adminAuth(token string, failLimiter *ratelimit.Limiter, trustProxyHeaders bool) func(http.Handler) http.Handler {
 	want := []byte(token)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -111,7 +112,7 @@ func adminAuth(token string, failLimiter *ratelimit.Limiter) func(http.Handler) 
 				next.ServeHTTP(w, r)
 				return
 			}
-			if !failLimiter.Allow(clientIP(r)) {
+			if !failLimiter.Allow(clientIP(r, trustProxyHeaders)) {
 				writeError(w, http.StatusTooManyRequests, "rate_limited", "too many failed authorization attempts")
 				return
 			}
@@ -154,12 +155,22 @@ func writeRateLimited(w http.ResponseWriter) {
 	writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
 }
 
-// clientIP takes the connection's remote address, not
-// X-Forwarded-For/X-Real-IP — this process isn't yet configured with a
-// trusted-proxy allowlist, and trusting a client-supplied header for
-// rate-limit keys without one would let it be spoofed to evade the limit
-// entirely.
-func clientIP(r *http.Request) string {
+// clientIP uses proxy headers only when the deployment explicitly marks its
+// ingress as trusted. The application port must not be directly reachable in
+// that mode, otherwise clients could spoof the header to evade rate limits.
+func clientIP(r *http.Request, trustProxyHeaders bool) string {
+	if trustProxyHeaders {
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			first, _, _ := strings.Cut(forwarded, ",")
+			if ip := net.ParseIP(strings.TrimSpace(first)); ip != nil {
+				return ip.String()
+			}
+		}
+		if realIP := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); realIP != nil {
+			return realIP.String()
+		}
+	}
+
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -170,6 +181,6 @@ func clientIP(r *http.Request) string {
 // voteRateLimitKey scopes the shared /token+/votes bucket to
 // (poll_id, ip) — see issueVoteTokenHandler's doc comment for why ip
 // alone isn't enough.
-func voteRateLimitKey(pollID uuid.UUID, r *http.Request) string {
-	return pollID.String() + ":" + clientIP(r)
+func voteRateLimitKey(pollID uuid.UUID, r *http.Request, trustProxyHeaders bool) string {
+	return pollID.String() + ":" + clientIP(r, trustProxyHeaders)
 }

@@ -28,6 +28,8 @@ test.describe("live backend smoke", () => {
   });
 
   test("public vote round-trips through a real backend and rejects a replayed token", async ({ page }) => {
+    test.setTimeout(60_000);
+
     const created = await fetch(`${backendBaseUrl}/v1/admin/polls`, {
       method: "POST",
       headers: adminHeaders,
@@ -79,5 +81,20 @@ test.describe("live backend smoke", () => {
     });
     expect(replay.status).toBe(409);
     expect(await replay.json()).toEqual({ status: "rejected", reason: "duplicate", option_id: 1 });
+
+    // The same elected scheduler that opened the poll must close it once
+    // closes_at arrives; otherwise the admin UI and snapshotter would keep
+    // treating an expired poll as open indefinitely.
+    await expect(async () => {
+      const detail = await fetch(`${backendBaseUrl}/v1/admin/polls/${poll.id}`, { headers: adminHeaders });
+      const body = await detail.json() as { state: string };
+      expect(body.state).toBe("closed");
+    }).toPass({ timeout: 45_000, intervals: [1000] });
+
+    await expect(async () => {
+      const results = await fetch(`${backendBaseUrl}/v1/admin/polls/${poll.id}/results`, { headers: adminHeaders });
+      const body = await results.json() as { state: string; total_accepted: number };
+      expect(body).toMatchObject({ state: "closed", total_accepted: 1 });
+    }).toPass({ timeout: 10_000, intervals: [500] });
   });
 });

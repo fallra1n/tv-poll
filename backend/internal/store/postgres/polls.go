@@ -363,3 +363,26 @@ func (s *PollStore) ListDuePolls(ctx context.Context, now time.Time) ([]uuid.UUI
 	}
 	return ids, rows.Err()
 }
+
+// ListExpiredOpenPolls returns open polls whose fixed voting window has ended.
+// The schedule worker transitions them to closed so admin state and snapshot
+// retention do not depend on an operator clicking close after every broadcast.
+func (s *PollStore) ListExpiredOpenPolls(ctx context.Context, now time.Time) ([]uuid.UUID, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT id FROM polls WHERE state = 'open' AND closes_at <= $1
+	`, now)
+	if err != nil {
+		return nil, fmt.Errorf("list expired open polls: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan expired open poll: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}

@@ -1,9 +1,5 @@
-// Package autoopen transitions polls from scheduled to open the moment
-// their scheduled_at arrives (review finding B4) — without this, a
-// human has to click "open" in the exact second the TV spot airs, which
-// defeats the entire point of docs/ai/02-load-model.md §6.5's
-// pre-scaling-by-schedule design: the peak is known to the second, but
-// only if something actually opens the poll on that second.
+// Package autoopen applies schedule-driven poll transitions: scheduled polls
+// open when scheduled_at arrives and open polls close at closes_at.
 package autoopen
 
 import (
@@ -12,25 +8,36 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/fallra1n/tvpoll/internal/cache"
+	"github.com/google/uuid"
+
 	"github.com/fallra1n/tvpoll/internal/domain"
-	"github.com/fallra1n/tvpoll/internal/leader"
-	"github.com/fallra1n/tvpoll/internal/store/postgres"
 )
 
-// AutoOpener runs only on the elected leader, same reasoning as
-// internal/snapshotter — otherwise every instance would race to open
-// the same poll every tick (harmless but noisy: TransitionPoll's
-// SELECT ... FOR UPDATE means only one would ever win).
+type elector interface {
+	IsLeader(context.Context) (bool, error)
+}
+
+type pollStore interface {
+	ListDuePolls(context.Context, time.Time) ([]uuid.UUID, error)
+	ListExpiredOpenPolls(context.Context, time.Time) ([]uuid.UUID, error)
+	TransitionPoll(context.Context, uuid.UUID, domain.TransitionRequest) (domain.Poll, error)
+}
+
+type pollCache interface {
+	Put(domain.Poll)
+}
+
+// AutoOpener runs only on the elected leader so replicas do not race through
+// the same scheduled transitions on every tick.
 type AutoOpener struct {
-	elector   *leader.Elector
-	polls     *postgres.PollStore
-	pollCache *cache.Cache
+	elector   elector
+	polls     pollStore
+	pollCache pollCache
 	logger    *slog.Logger
 }
 
-func New(elector *leader.Elector, polls *postgres.PollStore, pollCache *cache.Cache, logger *slog.Logger) *AutoOpener {
-	return &AutoOpener{elector: elector, polls: polls, pollCache: pollCache, logger: logger}
+func New(elector elector, polls pollStore, cacheWriter pollCache, logger *slog.Logger) *AutoOpener {
+	return &AutoOpener{elector: elector, polls: polls, pollCache: cacheWriter, logger: logger}
 }
 
 func (o *AutoOpener) Run(ctx context.Context, interval time.Duration) {
@@ -57,7 +64,13 @@ func (o *AutoOpener) tick(ctx context.Context) {
 		return
 	}
 
-	ids, err := o.polls.ListDuePolls(ctx, time.Now())
+	now := time.Now()
+	o.openDue(ctx, now)
+	o.closeExpired(ctx, now)
+}
+
+func (o *AutoOpener) openDue(ctx context.Context, now time.Time) {
+	ids, err := o.polls.ListDuePolls(ctx, now)
 	if err != nil {
 		o.logger.Error("autoopen: list due polls", "error", err)
 		return
@@ -83,5 +96,27 @@ func (o *AutoOpener) tick(ctx context.Context) {
 		// stale "scheduled" state and be wrongly rejected as closed.
 		o.pollCache.Put(poll)
 		o.logger.Info("autoopen: opened poll", "poll_id", id)
+	}
+}
+
+func (o *AutoOpener) closeExpired(ctx context.Context, now time.Time) {
+	ids, err := o.polls.ListExpiredOpenPolls(ctx, now)
+	if err != nil {
+		o.logger.Error("autoclose: list expired polls", "error", err)
+		return
+	}
+
+	for _, id := range ids {
+		poll, err := o.polls.TransitionPoll(ctx, id, domain.TransitionRequest{To: domain.PollClosed})
+		if err != nil {
+			var transErr *domain.TransitionError
+			if errors.As(err, &transErr) {
+				continue
+			}
+			o.logger.Error("autoclose: transition poll", "poll_id", id, "error", err)
+			continue
+		}
+		o.pollCache.Put(poll)
+		o.logger.Info("autoclose: closed poll", "poll_id", id)
 	}
 }

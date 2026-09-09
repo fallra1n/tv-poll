@@ -20,6 +20,10 @@ type Config struct {
 	// with a poll_id label can't leak live results publicly before an
 	// admin has published them (docs/ai/05-api-contract.md review: C7).
 	MetricsAddr string `env:"METRICS_ADDR" envDefault:"127.0.0.1:9090"`
+	// FrontendDir optionally serves a production frontend build from the API
+	// process. It is intended for a compact demo deployment; leave it empty
+	// when static assets are hosted by the production CDN boundary.
+	FrontendDir string `env:"FRONTEND_DIR" envDefault:""`
 
 	DatabaseURL string `env:"DATABASE_URL,required"`
 	RedisAddr   string `env:"REDIS_ADDR" envDefault:"127.0.0.1:6379"`
@@ -41,6 +45,11 @@ type Config struct {
 	// "*", since vote-token cookies are sent with credentials
 	// (docs/ai/01-stack.md, "Граница с фронтендом").
 	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS" envSeparator:","`
+
+	// TrustProxyHeaders allows client IP rate limits to use the first
+	// X-Forwarded-For address supplied by a trusted reverse proxy. Keep it
+	// false unless the application port is inaccessible to direct clients.
+	TrustProxyHeaders bool `env:"TRUST_PROXY_HEADERS" envDefault:"false"`
 
 	// CookieSecure controls the Secure flag on the vote_token cookie.
 	// Defaults to true (SameSite=None requires Secure in real browsers);

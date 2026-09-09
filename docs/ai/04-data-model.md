@@ -260,7 +260,7 @@ CREATE INDEX admin_audit_log_poll_id_idx ON admin_audit_log (poll_id);
 | `d:{poll_id}:{nonce}` | STRING, `SET NX GET EX` | обработчик голосования | dedup-ключ — единственная запись в Redis на голос, `03-deduplication.md` |
 | `poll:{id}:counts` | HASH, поле = `option_id` | флашер, раз в секунду | агрегированные голоса, источник `PollResults.options[].count` |
 | `poll:{id}:rejected` | HASH, поля `duplicate`/`rate_limited` | флашер, раз в секунду | источник `PollResults.rejected` |
-| `leader` | STRING, `SET NX EX` + продление | снапшоттер / авто-открытие | лиз лидерства, один на процесс-флот (`internal/leader`), не один на задачу |
+| `leader` | STRING, `SET NX EX` + продление | снапшоттер / автоматические переходы по расписанию | лиз лидерства, один на процесс-флот (`internal/leader`), не один на задачу |
 
 Определение опроса (`state`/`closes_at`/`option_count`) в Redis не
 зеркалируется вообще: обработчик голосования читает его из in-process

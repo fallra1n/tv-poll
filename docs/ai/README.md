@@ -21,6 +21,7 @@
 | [`sessions/01-frontend.md`](./sessions/01-frontend.md) | Ход frontend-сессии, уточнения пользователя и исправленные ветки |
 | [`sessions/02-backend.md`](./sessions/02-backend.md) | Ход backend-реализации: пересмотр горячего пути (без Lua), найденные и исправленные баги, реальные k6-замеры |
 | [`sessions/03-frontend-integration.md`](./sessions/03-frontend-integration.md) | Первая интеграция frontend с живым backend: два CORS/контрактных бага в backend, дрейф типов от контракта, доведение frontend до зелёных проверок |
+| [`sessions/04-jakeloud-deployment.md`](./sessions/04-jakeloud-deployment.md) | Подготовка demo-деплоя в JakeLoud: single-service image, persistent Postgres/Redis, trusted proxy и auto-close |
 | [`what-ai-got-wrong.md`](./what-ai-got-wrong.md) | Ошибки ИИ, найденные контрактной, browser- и backend-проверкой |
 
 `05` написан раньше `03` и `04` — в самом документе объяснено, почему это не

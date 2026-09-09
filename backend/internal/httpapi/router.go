@@ -80,7 +80,7 @@ func New(deps Deps) http.Handler {
 	})
 
 	r.Route("/v1/admin", func(admin chi.Router) {
-		admin.Use(adminAuth(deps.Config.AdminToken, adminFailLimiter))
+		admin.Use(adminAuth(deps.Config.AdminToken, adminFailLimiter, deps.Config.TrustProxyHeaders))
 		admin.Post("/polls", createPollHandler(deps))
 		admin.Get("/polls", listPollsHandler(deps))
 		admin.Get("/polls/{pollId}", getPollAdminHandler(deps))
@@ -90,9 +90,13 @@ func New(deps Deps) http.Handler {
 	})
 
 	r.Route("/internal", func(internal chi.Router) {
-		internal.Use(adminAuth(deps.Config.AdminToken, adminFailLimiter))
+		internal.Use(adminAuth(deps.Config.AdminToken, adminFailLimiter, deps.Config.TrustProxyHeaders))
 		internal.Post("/warmup", warmupHandler(deps))
 	})
+
+	if deps.Config.FrontendDir != "" {
+		mountFrontend(r, deps.Config.FrontendDir)
+	}
 
 	return r
 }

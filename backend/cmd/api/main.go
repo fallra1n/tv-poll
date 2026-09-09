@@ -97,8 +97,8 @@ func run() error {
 	snap := snapshotter.New(leaderElector, pollStore, snapshotStore, voteCounters, logger)
 	go snap.Run(ctx, time.Second)
 
-	// Review finding B4: without this, a human has to click "open" in
-	// the exact second the spot airs.
+	// Scheduled transitions are automatic: polls open at scheduled_at and
+	// close at closes_at without an operator racing the broadcast clock.
 	opener := autoopen.New(leaderElector, pollStore, pollCache, logger)
 	go opener.Run(ctx, time.Second)
 

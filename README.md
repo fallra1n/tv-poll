@@ -103,7 +103,8 @@ curl -s $BASE/v1/admin/polls/$POLL/results -H "Authorization: Bearer $ADMIN"
 # 9. Votes-over-time (the snapshot history, for a chart)
 curl -s $BASE/v1/admin/polls/$POLL/results/timeseries -H "Authorization: Bearer $ADMIN"
 
-# 10. Close it
+# 10. Close it early if needed. Otherwise the elected scheduler closes it
+#     automatically at closes_at.
 curl -s -XPOST $BASE/v1/admin/polls/$POLL/transitions -H "Authorization: Bearer $ADMIN" \
   -H 'Content-Type: application/json' -d '{"to":"closed"}'
 ```
@@ -255,6 +256,14 @@ CDN/edge, never from this Go service — only `POST` votes and the two GETs
 that need CORS hit `backend/` directly. See `frontend/README.md`'s CDN
 section for the exact fallback rewrite rules and cache headers a real deploy
 needs.
+
+## JakeLoud demo deployment
+
+A single-host demo deployment is documented in
+[`deploy/jakeloud/README.md`](deploy/jakeloud/README.md). It packages the API
+and static frontend into one image while keeping PostgreSQL and Redis in
+persistent host-level containers. This does not replace the CDN and clustered
+infrastructure required for the production load model.
 
 ## Project layout
 

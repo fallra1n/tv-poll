@@ -78,7 +78,7 @@ func getPollHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 			return
 		}
 
-		if !limiter.Allow(voteRateLimitKey(id, r)) {
+		if !limiter.Allow(voteRateLimitKey(id, r, deps.Config.TrustProxyHeaders)) {
 			writeRateLimited(w)
 			return
 		}
@@ -139,7 +139,7 @@ func issueVoteTokenHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFu
 			return
 		}
 
-		if !limiter.Allow(voteRateLimitKey(id, r)) {
+		if !limiter.Allow(voteRateLimitKey(id, r, deps.Config.TrustProxyHeaders)) {
 			writeRateLimited(w)
 			return
 		}
@@ -271,7 +271,7 @@ func castVoteHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 			return
 		}
 
-		if !limiter.Allow(voteRateLimitKey(pollID, r)) {
+		if !limiter.Allow(voteRateLimitKey(pollID, r, deps.Config.TrustProxyHeaders)) {
 			metrics.VotesRejected.WithLabelValues("rate_limited").Inc()
 			writeVoteRateLimited(w)
 			return
@@ -298,8 +298,8 @@ func castVoteHandler(deps Deps, limiter *ratelimit.Limiter) http.HandlerFunc {
 		}
 
 		// Re-checked here even though only `open` polls should be
-		// accepting votes: until auto-close exists, nothing else enforces
-		// this deadline, and even after it does, this is the same
+		// accepting votes: the schedule worker is eventually consistent,
+		// and this remains the same
 		// belt-and-suspenders check the original Lua design made
 		// (docs/ai/04-data-model.md §2.3: state OR closes_at violated ->
 		// closed) — a poll manually left open past its window must still
