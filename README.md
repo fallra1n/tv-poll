@@ -1,286 +1,272 @@
-# TV Poll — anonymous voting backend
+# TV Poll — анонимное голосование для ТВ-эфира
 
-Backend for a national TV polling company: a ~60s TV spot shows a one-question
-poll, viewers scan a QR code / follow a link and vote anonymously — no
-registration. Built for ~100M potential viewers per spot with a short,
-foreknown peak (the broadcast schedule is known in advance).
+Сервис для национальной опросной компании: в минутном ролике на ТВ показывают
+опрос из одного вопроса, зрители переходят по QR-коду или ссылке и голосуют
+анонимно, без регистрации. Рассчитан на ~100 млн потенциальных зрителей одного
+ролика и короткий пик, время которого известно заранее — по сетке вещания.
 
-This is a take-home assignment. The full architecture rationale — load model,
-stack choices, deduplication design, data model, API contract, and every
-rejected alternative — lives in [`docs/ai/`](docs/ai/README.md), including
-dead ends and revisions made while implementing (`docs/ai/sessions/`,
-`docs/ai/what-ai-got-wrong.md`). This file covers only what's needed to run
-and test the service.
+Тестовое задание. Полное обоснование архитектуры — модель нагрузки, выбор
+стека, схема дедупликации, модель данных, контракт API и все отвергнутые
+альтернативы — лежит в [`docs/ai/`](docs/ai/README.md) вместе с тупиками и
+пересмотренными решениями (`docs/ai/sessions/`, `docs/ai/what-ai-got-wrong.md`).
+Этот файл — только про то, как всё запустить и проверить.
 
-## Architecture, in one paragraph
+## Что реализовано
 
-Write-heavy, short predictable peak, aggregated-only reads. The vote hot path
-touches Redis exactly once (`SET NX GET` on a dedup key derived from a
-stateless, self-signed HMAC token — no Lua, correctness comes from Redis's
-own atomicity) and never touches Postgres. Vote counts live in memory per
-instance, flushed to Redis once a second; a leader-elected snapshotter drains
-Redis into Postgres once a second, which doubles as the results history.
-Postgres holds poll definitions, FSM state, and snapshots — never individual
-votes. See [`docs/ai/02-load-model.md`](docs/ai/02-load-model.md) for the load
-math this is built from and [`docs/ai/01-stack.md`](docs/ai/01-stack.md) for
-why each component was picked.
+- анонимное голосование без регистрации с базовой дедупликацией;
+- создание опросов через админку;
+- просмотр обезличенных результатов и динамики голосов через админку.
 
-## Prerequisites
+## Как это устроено
 
-- Docker + Docker Compose
-- `curl`, `python3` (for the examples below — any JSON-capable client works)
-- Go 1.23+ (only if running `go test`/`go build` outside Docker)
-- [k6](https://k6.io/) (only for load testing)
+Нагрузка write-heavy, пик короткий и предсказуемый, читаются только агрегаты.
+Голос проходит несколько проверок в памяти процесса и делает **ровно одну
+команду Redis** — `SET NX GET` по ключу дедупликации, выведенному из
+самоподписанного HMAC-токена. К PostgreSQL горячий путь не обращается никогда.
 
-## Run it
+Счётчики голосов копятся в памяти инстанса и раз в секунду сливаются в Redis;
+раз в секунду выбранный лидер переносит их из Redis в PostgreSQL. История этих
+снапшотов и есть график динамики голосов. Отдельные голоса не хранятся нигде —
+только агрегаты.
 
-```bash
-make up      # builds the image, starts postgres+redis, runs migrations, starts the API
-make down    # stops everything and removes volumes
-make logs    # follow the API's logs
+```
+браузер ──► POST /votes ──► проверки в памяти ──► SET NX GET (Redis)
+                                                        │
+              память процесса ──1с──► Redis ──1с──► PostgreSQL ──► админка
 ```
 
-`make up` polls `GET /healthz` implicitly via each service's own healthcheck;
-once it returns, confirm directly:
+Подробно: [`docs/ai/02-load-model.md`](docs/ai/02-load-model.md) — расчёт
+нагрузки, [`docs/ai/01-stack.md`](docs/ai/01-stack.md) — почему выбран каждый
+компонент.
+
+## Выбор технологий
+
+| Технология | Почему |
+|---|---|
+| **Go 1.26**, stdlib `net/http` + `go-chi/chi` | Горячий путь — это несколько проверок в памяти и одна команда Redis. Фреймворк здесь ничего не ускоряет; `chi` взят только ради middleware и группировки маршрутов |
+| **Redis 7** | Дедупликация одной атомарной командой `SET NX GET` и буфер счётчиков. Единственная внешняя система на пути голоса |
+| **PostgreSQL 16** + `jackc/pgx/v5` | Холодное хранилище: определения опросов, состояние FSM, снапшоты, аудит. Нагрузка — порядка одной строки в секунду на опрос, узким местом не является |
+| `pressly/goose` | Миграции обычным SQL, отдельной командой — схема из 4 таблиц не требует ORM или кодогенерации |
+| `log/slog`, JSON | Горячий путь не логирует ничего, кроме ошибок: 100 тыс. строк в секунду были бы отдельной аварией |
+| `prometheus/client_golang` | Принятые и отклонённые голоса, латентность обработчика, время команд Redis — чтобы числа в документации были замерены, а не придуманы |
+| `testcontainers-go` | Интеграционные тесты против настоящих Redis и PostgreSQL. `miniredis` неполно эмулирует именно ту комбинацию `SET NX GET`, на которой держится дедупликация |
+| **k6** | Голосование двухшаговое — сначала токен, потом голос. `wrk` и `vegeta` такой сценарий не выражают |
+| **Bun** + React 19 + Tailwind 4 | Фронтенд собирается в статику для CDN. Два независимых бандла: публичная страница без роутера и графиков, админка отдельно |
+
+Сознательно **не** взяты Kafka/NATS, Kubernetes, gRPC, ClickHouse, ORM,
+WebSockets и CAPTCHA — с обоснованием по каждому пункту в разделах
+«что сознательно не берём» в [`docs/ai/01-stack.md`](docs/ai/01-stack.md) и
+[`docs/ai/03-deduplication.md`](docs/ai/03-deduplication.md).
+
+## Локальный запуск
+
+### Требования
+
+- Docker и Docker Compose;
+- Bun 1.4.2 — для фронтенда;
+- Go 1.26+ — только если запускать тесты бэкенда вне Docker;
+- `curl` и `python3` — только для примеров с curl ниже;
+- [k6](https://k6.io/) — только для нагрузочного теста.
+
+### 1. Бэкенд
+
+```bash
+make up      # собирает образ, поднимает PostgreSQL и Redis, применяет миграции, запускает API
+make logs    # логи API
+make down    # остановить всё и удалить тома
+```
+
+Проверка:
 
 ```bash
 curl -s http://localhost:8080/healthz
 # {"postgres":"ok","redis":"ok","status":"ok"}
 ```
 
-Config is env vars with sane local defaults — see
-[`.env.example`](.env.example) for the full list and
-[`docker-compose.yml`](docker-compose.yml) for what's actually passed to the
-container. Nothing needs to be set to run locally; `ADMIN_TOKEN` and
-`VOTE_TOKEN_SECRET` should be changed before deploying anywhere real.
+- API — `http://localhost:8080`
+- Метрики — `http://localhost:9090/metrics`
+- Токен админки — `local-dev-admin-token` (значение по умолчанию из `docker-compose.yml`)
 
-## Walking through the full flow
+Настраивать ничего не нужно. Полный список переменных — в
+[`.env.example`](.env.example); перед любым реальным деплоем меняются
+`ADMIN_TOKEN` и `VOTE_TOKEN_SECRET`.
 
-Everything below is real `curl` against a running `make up` stack — not
-illustrative pseudocode.
+### 2. Фронтенд
+
+В отдельном терминале:
+
+```bash
+cd frontend
+bun install
+bun run api:types   # типы из ../api/openapi.yaml
+bun run dev
+```
+
+Открывается на `http://localhost:3000`. Бэкенд из `make up` уже разрешает этот
+origin в CORS, дополнительная настройка не нужна. Остальные команды и разбор
+границы с CDN — в [`frontend/README.md`](frontend/README.md), обоснование
+архитектуры фронтенда — в [`docs/ai/06-frontend.md`](docs/ai/06-frontend.md).
+
+### 3. Проверить целиком, руками
+
+1. Откройте `http://localhost:3000/admin` и введите токен `local-dev-admin-token`.
+2. «Создать опрос»: вопрос, минимум два варианта, окно голосования в секундах.
+   Отметьте «запланировать» и поставьте время эфира через минуту.
+3. Опрос откроется **сам** в указанное время и закроется сам по истечении окна —
+   кликать «открыть» в секунду эфира не нужно. Кнопки ручного открытия и
+   досрочного завершения на странице опроса тоже есть.
+4. На странице опроса нажмите «Копировать ссылку» — это публичный адрес вида
+   `http://localhost:3000/polls/{id}`. Откройте его в другом окне и проголосуйте.
+5. Вернитесь в админку: счётчики и график обновляются раз в секунду.
+6. Проголосуйте в том же окне повторно — увидите «Ваш голос уже учтён» с
+   указанием засчитанного варианта.
+
+Локально по http браузер отбрасывает cookie `vote_token`: она ставится с
+`SameSite=None`, а такая комбинация без `Secure` не сохраняется. Это не ошибка —
+фронтенд хранит токен в `localStorage` и шлёт его в заголовке `X-Vote-Token`,
+поэтому голосование работает. На проде за HTTPS cookie работает как резервный
+канал.
+
+### 4. Проверить через curl
+
+Всё ниже — реальные запросы к поднятому `make up`, не псевдокод.
 
 ```bash
 BASE=http://localhost:8080
-ADMIN=local-dev-admin-token   # matches docker-compose.yml's default
+ADMIN=local-dev-admin-token
 
-# 1. Create a poll (draft)
+# Создать опрос
 POLL=$(curl -s -XPOST $BASE/v1/admin/polls -H "Authorization: Bearer $ADMIN" \
   -H 'Content-Type: application/json' \
   -d '{"question":"Кто выиграет?","options":[{"label":"Команда А"},{"label":"Команда Б"}]}' \
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 
-# 2. Schedule it — closes_at is fixed the moment this is called
-#    (scheduled_at + voting_window_seconds), not when it actually opens
-FUTURE=$(python3 -c 'import datetime;print((datetime.datetime.utcnow()+datetime.timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+# Запланировать на через 5 секунд. closes_at фиксируется прямо сейчас
+# (scheduled_at + voting_window_seconds), а не в момент открытия
+FUTURE=$(python3 -c 'import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
 curl -s -XPOST $BASE/v1/admin/polls/$POLL/transitions -H "Authorization: Bearer $ADMIN" \
   -H 'Content-Type: application/json' -d "{\"to\":\"scheduled\",\"scheduled_at\":\"$FUTURE\"}"
 
-# 3. Wait — nobody needs to click "open": the poll opens itself at
-#    scheduled_at (an elected leader instance transitions it automatically)
-sleep 6
+sleep 6   # опрос открылся сам
 
-# 4. Public, CDN-cacheable poll definition (no auth, no state field —
-#    see docs/ai/05-api-contract.md for why)
-curl -s -i $BASE/v1/polls/$POLL
+# Публичное определение опроса — кешируемое, без авторизации
+curl -s $BASE/v1/polls/$POLL
 
-# 5. Get a vote token (two-step flow: token first, then vote)
+# Токен, затем голос
 TOKEN=$(curl -s -XPOST $BASE/v1/polls/$POLL/token | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
-
-# 6. Vote
 curl -s -XPOST $BASE/v1/polls/$POLL/votes -H "X-Vote-Token: $TOKEN" \
   -H 'Content-Type: application/json' -d '{"option_id":1}'
 # {"status":"accepted","option_id":1}
 
-# 7. Same token again — rejected, and told which option was already counted
+# Тот же токен ещё раз — отказ с указанием уже засчитанного варианта
 curl -s -XPOST $BASE/v1/polls/$POLL/votes -H "X-Vote-Token: $TOKEN" \
   -H 'Content-Type: application/json' -d '{"option_id":2}'
 # {"status":"rejected","reason":"duplicate","option_id":1}
 
-# 8. Results (admin) — eventually consistent, up to ~1s behind
+# Результаты и динамика (админка). Отстают не более чем на ~1 секунду
 sleep 2
 curl -s $BASE/v1/admin/polls/$POLL/results -H "Authorization: Bearer $ADMIN"
-
-# 9. Votes-over-time (the snapshot history, for a chart)
 curl -s $BASE/v1/admin/polls/$POLL/results/timeseries -H "Authorization: Bearer $ADMIN"
-
-# 10. Close it early if needed. Otherwise the elected scheduler closes it
-#     automatically at closes_at.
-curl -s -XPOST $BASE/v1/admin/polls/$POLL/transitions -H "Authorization: Bearer $ADMIN" \
-  -H 'Content-Type: application/json' -d '{"to":"closed"}'
 ```
 
-The full wire contract is [`api/openapi.yaml`](api/openapi.yaml) (lint it with
-`npx @redocly/cli lint api/openapi.yaml`); the rationale for every
-non-obvious call in it is in
-[`docs/ai/05-api-contract.md`](docs/ai/05-api-contract.md).
+Полный контракт — [`api/openapi.yaml`](api/openapi.yaml) (проверяется командой
+`npx @redocly/cli lint api/openapi.yaml`), обоснование каждого неочевидного
+решения в нём — [`docs/ai/05-api-contract.md`](docs/ai/05-api-contract.md).
 
-## Metrics
-
-Prometheus metrics are on a **separate, loopback-only listener**
-(`METRICS_ADDR`, default `127.0.0.1:9090`), not the main port — an
-unauthenticated `votes_accepted_total{poll_id=...}` on the same port as the
-vote endpoints would leak a live poll's tally before an admin publishes
-results.
+## Тесты
 
 ```bash
-curl -s http://localhost:9090/metrics | grep -E '^(votes_|vote_handler_duration|redis_command_duration|inflight_requests)'
-```
-
-## Testing
-
-```bash
+# Бэкенд
 cd backend
-go test ./... -short   # unit tests only, no Docker needed, ~2s
-go test ./...          # + integration tests against real Postgres/Redis via testcontainers, needs Docker
+go test ./... -short   # только unit, без Docker, несколько секунд
+go test ./...          # + интеграционные против настоящих PostgreSQL и Redis (нужен Docker)
+
+# Фронтенд
+cd frontend
+bun run typecheck
+bun run lint
+bun run test           # unit
+bunx playwright install chromium   # один раз перед первым e2e
+bun run test:e2e       # Playwright, desktop + mobile
 ```
 
-Unit tests cover pure logic: poll validation, the FSM's transition table,
-vote-token sign/verify (including secret rotation and every malformed-input
-case), the local rate limiter, the in-memory counter's swap/restore
-semantics, and the snapshot monotonicity merge. Integration tests run
-against real Postgres 16 / Redis 7 containers (deliberately not
-`miniredis`, which emulates the exact command combination the dedup claim
-relies on — `SET NX GET` — incompletely) and include the two properties
-that matter most for correctness:
+Unit-тесты покрывают чистую логику: валидацию опроса, таблицу переходов FSM,
+подпись и разбор токена, локальный rate limiter, семантику счётчиков в памяти,
+монотонность слияния снапшотов. Два свойства проверяются на настоящих
+контейнерах:
 
-- **Concurrency**: `TestDedupStore_TryClaim_Concurrent` fires 200 goroutines
-  claiming the same token concurrently — exactly one is accepted, proving
-  the dedup guarantee holds under a real race, not just in isolation.
-- **Monotonicity**: `TestSnapshotStore_InsertSnapshot_Monotonicity` proves
-  that if Redis loses data between two snapshot ticks, the stored result
-  never goes backwards (a votes-over-time chart must never show votes
-  disappearing).
+- **конкурентность** — 200 горутин одновременно предъявляют один токен, принят
+  ровно один голос;
+- **монотонность** — если Redis потеряет данные между снапшотами, записанный
+  результат не уменьшается: график динамики не может показать исчезновение
+  голосов.
 
-## Load testing
+E2E `test:e2e` включает сценарий против **живого** бэкенда: он создаёт опрос,
+дожидается автоматического открытия, голосует через настоящий браузер,
+проверяет отказ по повторному токену и автоматическое закрытие. Если `make up`
+не запущен, этот сценарий пропускается, остальные проходят на моках.
+
+## Нагрузочное тестирование
 
 ```bash
-# Every k6 VU on one machine shares one source IP, and the per-(poll,ip)
-# rate limiter is designed to stop exactly that pattern — so it has to be
-# raised for the duration of a load test, or you're measuring the limiter,
-# not the vote hot path.
+# У всех VU одна машина и один IP, а лимитер по (poll_id, IP) существует ровно
+# для такого паттерна — иначе замеряется лимитер, а не горячий путь
 docker compose down -v
 RATE_LIMIT_RPS=100000 RATE_LIMIT_BURST=100000 docker compose up --build -d
 
-k6 run load/vote.js                    # default: 3,000 votes over the full curve
-TARGET_VOTES=1200000 k6 run load/vote.js  # scale the whole curve up
+k6 run load/vote.js
+TARGET_VOTES=1200000 k6 run load/vote.js   # масштабировать всю кривую
 ```
 
-`load/vote.js` uses k6's `ramping-arrival-rate` executor (not a flat VU
-count — voting is a two-step flow, fetch a token then spend it, which is
-why `vegeta`/`wrk` don't fit) shaped to the arrival-time curve from
-[`docs/ai/02-load-model.md` §3](docs/ai/02-load-model.md): a fast rise in
-the first 15s, a plateau at 30–60s while the spot is still airing, then a
-long tail after it ends.
+`load/vote.js` использует `ramping-arrival-rate` по кривой прихода голосов из
+[`docs/ai/02-load-model.md` §3](docs/ai/02-load-model.md): быстрый рост первые
+15 секунд, плато на 30–60-й секунде, длинный хвост после ролика.
 
-### Measured results
-
-Single API instance, `docker compose` (Go container + Postgres 16 +
-Redis 7), on a MacBook — **not** the dedicated 4-vCPU box
-`02-load-model.md` §4.2 estimates against, and the whole docker-compose
-network stack is included in these numbers, not a bare Go binary. These are
-real measurements, not the extrapolated planning numbers from the docs
-presented as if they were measured — see that document's own explicit
-warning about the difference.
-
-**The actual deliverable run** — `load/vote.js` unmodified, shaped to the
-full §3 curve (0→peak in 30s, plateau, 120s tail), `TARGET_VOTES=1200000`
-(peak ≈ 12,000 votes/s):
+**Замер на одном инстансе** (docker compose на ноутбуке, не на выделенном
+железе из расчётов — сетевой стек compose включён в числа):
 
 | | |
 |---|---|
-| Duration | 5m3s (the curve's own length) |
-| Votes accepted | 1,604,210 |
-| HTTP errors | 0 (0.00% of 3,208,429 requests) |
-| p95 / **p99** vote latency | 73.6 ms / **98.6 ms** |
-| SLO (`p99 < 200ms`) | ✓ passed |
+| Принято голосов | 1 604 210 за 5 мин 3 с |
+| Ошибок HTTP | 0 из 3 208 429 запросов |
+| p95 / **p99** латентности голоса | 73,6 мс / **98,6 мс** |
+| SLO `p99 < 200 мс` | выполнен |
 
-Zero failures across the full arrival curve, not just at a single sustained
-rate — the shape (fast rise → plateau → long tail) doesn't itself create
-latency a flat load at the same intensity wouldn't.
+Потолок одного инстанса по этому SLO — **12–14 тыс. голосов/с**. Плановая
+оценка в документации была 15 тыс./с на выделенном железе, то есть замер её
+скорее подтверждает. Экстраполяция на пиковые 75 тыс. RPS — линейная и заявлена
+именно как экстраполяция: ноутбук такую нагрузку не сгенерирует.
+`75 000 / 13 000 ≈ 6` инстансов, с полуторакратным запасом ≈ 9.
 
-**Finding the ceiling** — a series of shorter constant-rate probes (ad hoc,
-not the committed script, same rate-limiter caveat as above) to bracket
-where p99 crosses 200ms:
-
-| Target rate (votes/s) | Achieved | p95 | p99 | Errors |
-|---|---|---|---|---|
-| 500 | 500 | 0.9 ms | — | 0% |
-| 3,000 | 2,663 | 0.4 ms | — | 0% |
-| 10,000 | 8,875 | 1.5 ms | — | 0% |
-| 12,000 | 10,893 | 21 ms | 45 ms | 0% |
-| 14,000 | 12,625 | 40 ms | 70 ms | 0% |
-| 15,000 | 13,474 | 29 ms | — | 0% |
-| 17,000 | 8,714 | 526 ms | 786 ms | 0%* |
-
-\* 0% HTTP failures, but throughput collapsed below target and
-`dropped_iterations` climbed — the pipeline is saturated, not returning
-errors.
-
-**Single-instance ceiling (p99 < 200ms SLO): ~12,000–14,000 votes/s** on this
-laptop. `02-load-model.md` §4.2's untested planning estimate was 15,000
-RPS/instance on dedicated hardware — close to what was actually measured
-here despite the docker-compose overhead, which is a reasonable validation
-of that estimate rather than a contradiction of it.
-
-**Extrapolation to the base scenario's 75,000 RPS peak** (§4.2): linear,
-stated explicitly rather than re-measured — a laptop cannot generate 75k
-RPS to test that directly. `75,000 / 13,000 ≈ 6` instances at the measured
-ceiling, `× 1.5` headroom (the same margin the docs apply everywhere) `≈ 9`
-instances — in the same range as the original 8-instance estimate.
-
-## Frontend
-
-`frontend/` is a separate Bun/React 19 codebase, built only against
-[`api/openapi.yaml`](api/openapi.yaml) — see
-[`docs/ai/06-frontend.md`](docs/ai/06-frontend.md) for the architecture
-rationale and [`frontend/README.md`](frontend/README.md) for the full command
-list.
-
-```bash
-cd frontend
-bun install
-bun run api:types   # generate src/lib/api/schema.generated.ts from ../api/openapi.yaml
-bun run dev          # http://localhost:3000, with the backend from `make up` at :8080
-```
-
-Two HTML entrypoints, built and cached independently:
-
-- `/polls/{pollId}` — the public voting page. No router, no admin code, no
-  Recharts in this bundle — this is the page up to ~28M devices could load
-  per broadcast (`docs/ai/02-load-model.md`), so it stays minimal.
-- `/admin/*` — poll management, FSM transitions, and results/timeseries
-  charts, Bearer-token gated.
-
-**CDN boundary**: `frontend/dist/` is meant to be served from a static
-CDN/edge, never from this Go service — only `POST` votes and the two GETs
-that need CORS hit `backend/` directly. See `frontend/README.md`'s CDN
-section for the exact fallback rewrite rules and cache headers a real deploy
-needs.
-
-## JakeLoud demo deployment
-
-A single-host demo deployment is documented in
-[`deploy/jakeloud/README.md`](deploy/jakeloud/README.md). It packages the API
-and static frontend into one image while keeping PostgreSQL and Redis in
-persistent host-level containers. This does not replace the CDN and clustered
-infrastructure required for the production load model.
-
-## Project layout
+## Структура репозитория
 
 ```
-backend/          Go service (see backend/internal for package-level docs)
-api/openapi.yaml   Wire contract — the boundary with the frontend
-frontend/          Separate codebase, built against api/openapi.yaml
-docs/ai/           Architecture rationale, load model, decision record, AI session logs
-load/vote.js       k6 load test
+backend/           Go-сервис (документация по пакетам — в backend/internal)
+api/openapi.yaml   Контракт — граница между бэкендом и фронтендом
+frontend/          Отдельная кодовая база, собирается по api/openapi.yaml
+docs/ai/           Обоснование архитектуры, модель нагрузки, логи работы с ИИ
+load/vote.js       Нагрузочный тест k6
+deploy/jakeloud/   Однохостовой демо-деплой
 ```
 
-## What's deliberately not here
+Читать `docs/ai/` следует **в обратном порядке нумерации**: сначала
+[`02-load-model.md`](docs/ai/02-load-model.md) — модель нагрузки, из которой
+следует всё остальное, затем [`01-stack.md`](docs/ai/01-stack.md) — выбор стека,
+и [`00-task-original.md`](docs/ai/00-task-original.md) — исходное задание
+дословно. Порядок объяснён в [`docs/ai/README.md`](docs/ai/README.md).
 
-No Kubernetes manifests, no CI beyond what's implied by `go test`, no
-production secret management, no CAPTCHA/proof-of-work on voting (would
-directly contradict R2: dedup only needs to stop an average non-technical
-user, not a proxy pool), no per-vote storage (results are aggregated only,
-by design — R8). Each of these is a deliberate decision, not an omission;
-see the "что сознательно не берём" tables in `docs/ai/01-stack.md` and
+## Демо-деплой
+
+Однохостовой вариант описан в
+[`deploy/jakeloud/README.md`](deploy/jakeloud/README.md): API и статика
+собираются в один образ, PostgreSQL и Redis живут в постоянных контейнерах на
+хосте. Это демо, а не замена CDN и кластеру из модели нагрузки.
+
+## Что сознательно не сделано
+
+Нет манифестов Kubernetes, CI, управления секретами, CAPTCHA на голосовании
+(прямо противоречит требованию «дедупликация против обычного пользователя, а не
+против пула прокси») и хранения отдельных голосов (результаты обезличены и
+агрегированы по замыслу). Каждый пункт — решение, а не пропуск; разбор в
+таблицах «что сознательно не берём» в `docs/ai/01-stack.md` и
 `docs/ai/03-deduplication.md`.
