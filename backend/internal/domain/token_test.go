@@ -1,7 +1,9 @@
 package domain
 
 import (
+	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,8 +91,7 @@ func TestVoteToken_TamperedSignature(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tampered := wire[:len(wire)-1] + flipLastChar(wire[len(wire)-1:])
-	_, err = VerifyVoteToken(tampered, pollID, time.Now(), []string{"secret"})
+	_, err = VerifyVoteToken(tamperSignature(t, wire), pollID, time.Now(), []string{"secret"})
 	if !errors.Is(err, ErrTokenSignature) && !errors.Is(err, ErrTokenMalformed) {
 		t.Fatalf("expected ErrTokenSignature or ErrTokenMalformed, got %v", err)
 	}
@@ -148,9 +149,31 @@ func TestVoteToken_MalformedWire(t *testing.T) {
 	}
 }
 
-func flipLastChar(s string) string {
-	if s == "A" {
-		return "B"
+// tamperSignature flips one bit of the *decoded* signature and re-encodes it,
+// so the token always carries a genuinely different tag.
+//
+// Editing the base64 text directly would be flaky, which is how this started
+// out: the tag is 16 bytes, so its final base64url character encodes only the
+// low 2 bits of the last byte and is always one of A/Q/g/w. Swapping that
+// character for "B" changes only the bits base64 ignores on decode — the tag
+// comes back byte-identical, the signature still verifies, and the test failed
+// on roughly one run in four (measured: 7 of 40).
+func tamperSignature(t *testing.T, wire string) string {
+	t.Helper()
+
+	payloadPart, tagPart, ok := strings.Cut(wire, ".")
+	if !ok {
+		t.Fatalf("issued token has no separator: %q", wire)
 	}
-	return "A"
+
+	tag, err := base64.RawURLEncoding.DecodeString(tagPart)
+	if err != nil {
+		t.Fatalf("decode issued tag: %v", err)
+	}
+	if len(tag) == 0 {
+		t.Fatal("issued token has an empty tag")
+	}
+	tag[0] ^= 0x01
+
+	return payloadPart + "." + base64.RawURLEncoding.EncodeToString(tag)
 }
