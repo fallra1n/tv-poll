@@ -81,6 +81,46 @@ Playwright test timeout оставался 30 секунд, а минималь�
 poll успешно закрылся сразу после прерывания теста. Исправление — локальный
 timeout 60 секунд для единственного live-теста; повторный прогон дал 10/10.
 
+## Фактический JakeLoud smoke
+
+Изменения были отправлены в `main` тремя проверенными коммитами:
+
+- `0d94890` — root image, runtime/config изменения и deployment scripts;
+- `a31b933` — self-bootstrap persistent dependencies без отдельного SSH;
+- `57143ff` — сериализация параллельного provisioning.
+
+JakeLoud release 4 собрал `57143ff`, применил Goose migration version 1 и
+после пятиминутного liveness window перешёл в `running/active` на внутреннем
+host port 38003. Публичный origin:
+`https://tv-poll.158.160.165.223.sslip.io`.
+
+После promotion с внешней машины проверено:
+
+- HTTP перенаправляется на HTTPS с `301`;
+- сертификат Let's Encrypt выдан именно для
+  `tv-poll.158.160.165.223.sslip.io`;
+- `/healthz` отвечает `200` и сообщает `postgres=ok`, `redis=ok`;
+- `/admin` и прямой SPA deep link `/polls/<uuid>` отвечают `200`;
+- production assets отвечают `200` с immutable cache;
+- CORS preflight отвечает `204` с ожидаемыми allow/expose headers;
+- admin API без bearer token отвечает `401`.
+
+Финальный flow выполнен на реальном poll
+`a1be6e05-d0cc-4250-af66-a2a89bd876a3` с окном
+`09:25:59Z`–`09:26:59Z`:
+
+1. Опубликованное определение было доступно до эфира.
+2. До auto-open голос вернул `409 rejected/closed`.
+3. После auto-open голос за option 1 вернул `201 accepted`.
+4. Повтор тем же token за option 2 вернул `409 duplicate` и исходный
+   `option_id=1`.
+5. После `closes_at` неиспользованный token вернул `401`, потому что срок его
+   HMAC-подписи совпадает с концом окна.
+6. В admin UI после refresh подтверждены `closed`, один принятый голос,
+   option 1 = 1, option 2 = 0 и один duplicate. Это отдельно подтверждает
+   auto-close и PostgreSQL snapshot; их нельзя вывести только из публичного
+   отказа после временной границы.
+
 ## Что сознательно остаётся за границей demo
 
 - атомарная граница между Redis dedup claim и in-memory increment;
