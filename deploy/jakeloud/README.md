@@ -5,16 +5,22 @@ PostgreSQL and Redis remain persistent host-level containers outside JakeLoud's
 release lifecycle. It is intended for demonstrating the take-home flow, not for
 the 75k votes/s production model described in `docs/ai/02-load-model.md`.
 
-## 1. Configure the host
+## 1. Configure the project
 
-SSH to the JakeLoud host, clone the repository (or use an existing JakeLoud
-release directory), and run:
+Use these values in the JakeLoud UI:
 
-```bash
-sudo ./deploy/jakeloud/provision.sh https://tv-poll.158.160.165.223.sslip.io
+```text
+Name: tv-poll
+Repository: git@github.com:fallra1n/tv-poll.git
+Domain: tv-poll.158.160.165.223.sslip.io
+Liveness timeout: 5 minutes
+Build and start command:
+PUBLIC_URL=https://tv-poll.158.160.165.223.sslip.io exec ./deploy/jakeloud/run.sh
 ```
 
-The script creates:
+JakeLoud runs the release command as root and supplies a different `$PORT` to
+each candidate release. On the first run, `run.sh` invokes the idempotent
+provisioner. It creates:
 
 - `/etc/tvpoll/app.env` and `/etc/tvpoll/postgres.env` with mode `0600`;
 - private Docker network `tvpoll`;
@@ -24,21 +30,18 @@ The script creates:
 Database ports are not published on the host. Re-running the script preserves
 the existing secrets and data.
 
-## 2. Configure the project
+The release then builds the root image, applies idempotent Goose migrations,
+and binds the app only to `127.0.0.1:$PORT`; JakeLoud's Nginx is the sole
+public ingress.
 
-Use these values in the JakeLoud UI:
+## 2. Optional manual provisioning
 
-```text
-Name: tv-poll
-Repository: git@github.com:fallra1n/tv-poll.git
-Domain: tv-poll.158.160.165.223.sslip.io
-Liveness timeout: 5 minutes
-Build and start command: exec ./deploy/jakeloud/run.sh
+If SSH access is available, the same setup can be performed before the first
+release from a current repository checkout:
+
+```bash
+sudo ./deploy/jakeloud/provision.sh https://tv-poll.158.160.165.223.sslip.io
 ```
-
-JakeLoud supplies a different `$PORT` to each candidate release. `run.sh`
-builds the root image, applies idempotent Goose migrations, and binds the app
-only to `127.0.0.1:$PORT`; JakeLoud's Nginx is the sole public ingress.
 
 ## 3. Verify before promotion
 

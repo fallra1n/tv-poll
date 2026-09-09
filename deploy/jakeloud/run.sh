@@ -6,9 +6,17 @@ set -eu
 
 config_dir=${TVPOLL_CONFIG_DIR:-/etc/tvpoll}
 env_file="$config_dir/app.env"
+
+# JakeLoud runs release commands as root. Supplying the non-secret public URL
+# lets the first release provision its persistent dependencies without a
+# separate SSH session; later releases only re-check the idempotent setup.
+if [ -n "${PUBLIC_URL:-}" ]; then
+  ./deploy/jakeloud/provision.sh "$PUBLIC_URL"
+fi
+
 if [ ! -r "$env_file" ]; then
   printf 'Missing readable environment file: %s\n' "$env_file" >&2
-  printf 'Run deploy/jakeloud/provision.sh on the JakeLoud host first.\n' >&2
+  printf 'Set PUBLIC_URL in the JakeLoud command or run provision.sh on the host.\n' >&2
   exit 1
 fi
 

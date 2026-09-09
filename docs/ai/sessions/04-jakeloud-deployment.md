@@ -45,6 +45,12 @@ production под расчётные 75k голосов/с. PostgreSQL и Redis 
 8. Закрывать poll автоматически по `closes_at` тем же leader-controlled
    scheduler, который выполняет auto-open. Ручной close остаётся досрочным
    операторским действием.
+9. Попытка выполнить provisioning по SSH из рабочей среды обнаружила дефект
+   cloud image: root key принимался, но forced command требовал пользователя
+   `NONE`, для которого тот же ключ не авторизован. Поэтому первый release
+   умеет безопасно вызвать idempotent provisioner сам. В custom command
+   передаётся только несекретный `PUBLIC_URL`; JakeLoud запускает команду от
+   root, а сгенерированные секреты остаются в `/etc/tvpoll`.
 
 ## Проверка и найденная ошибочная ветка
 
