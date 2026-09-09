@@ -28,7 +28,8 @@ provisioner. It creates:
 - Redis 7 with AOF, `noeviction`, and volume `tvpoll-redis-data`.
 
 Database ports are not published on the host. Re-running the script preserves
-the existing secrets and data.
+the existing secrets and data. A host-wide lock makes concurrent candidate
+releases wait rather than racing while creating first-run resources.
 
 The release then builds the root image, applies idempotent Goose migrations,
 and binds the app only to `127.0.0.1:$PORT`; JakeLoud's Nginx is the sole

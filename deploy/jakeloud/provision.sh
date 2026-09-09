@@ -11,6 +11,19 @@ if [ "$#" -ne 1 ]; then
   exit 1
 fi
 
+command -v flock >/dev/null 2>&1 || {
+  printf 'flock is required.\n' >&2
+  exit 1
+}
+
+# Domain updates and manual reboots can briefly overlap candidate releases.
+# Serialize the host-wide setup so first-run resource creation stays atomic.
+exec 9>/var/lock/tvpoll-provision.lock
+if ! flock -w 300 9; then
+  printf 'Timed out waiting for another TV Poll provisioner.\n' >&2
+  exit 1
+fi
+
 public_url=${1%/}
 case "$public_url" in
   https://*) ;;

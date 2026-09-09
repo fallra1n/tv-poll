@@ -51,6 +51,12 @@ production под расчётные 75k голосов/с. PostgreSQL и Redis 
    умеет безопасно вызвать idempotent provisioner сам. В custom command
    передаётся только несекретный `PUBLIC_URL`; JakeLoud запускает команду от
    root, а сгенерированные секреты остаются в `/etc/tvpoll`.
+10. Изменение domain и следующий full reboot могут ненадолго запустить два
+    candidate release параллельно. Первый реальный запуск поймал эту гонку:
+    один process создал `tvpoll-redis`, пока второй уже прошёл `inspect` и
+    тоже вызвал `docker run`. Весь host-wide provisioning сериализован через
+    `flock`; это защищает и создание containers, и первоначальную запись пары
+    env-файлов с общим database password.
 
 ## Проверка и найденная ошибочная ветка
 
